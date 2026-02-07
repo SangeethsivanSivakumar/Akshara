@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import logging
 import os
 import re
 import shutil
@@ -153,6 +154,32 @@ Instructions:
 6. If the transcription is already correct, output it unchanged."""
 
 console = Console()
+log = logging.getLogger("akshara")
+
+
+def setup_logging() -> Path:
+    """Configure file logging. Returns the log file path."""
+    DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = DEFAULT_OUTPUT_DIR / "akshara.log"
+
+    # Avoid duplicate handlers if called more than once
+    resolved = str(log_path.resolve())
+    for h in log.handlers[:]:
+        if isinstance(h, logging.FileHandler) and h.baseFilename == resolved:
+            break
+    else:
+        handler = logging.FileHandler(log_path, encoding="utf-8")
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s  %(levelname)-5s  %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        log.addHandler(handler)
+
+    log.setLevel(logging.DEBUG)
+
+    log.info("=" * 60)
+    log.info("Session started")
+    return log_path
 
 
 class RateLimitError(Exception):
@@ -493,6 +520,7 @@ def _call_gemini(
 ) -> str:
     """Shared API call logic with rate-limit detection and server-error retry."""
     for attempt in range(MAX_RETRIES):
+        t0 = time.monotonic()
         try:
             config_kwargs = dict(
                 system_instruction=system_instruction,
@@ -504,38 +532,73 @@ def _call_gemini(
                     thinking_budget=thinking_budget
                 )
 
+            log.info(
+                "API call start: page=%d, label=%s, model=%s, attempt=%d/%d",
+                page_num, label, model, attempt + 1, MAX_RETRIES,
+            )
+
             response = client.models.generate_content(
                 model=model,
                 contents=contents,
                 config=types.GenerateContentConfig(**config_kwargs),
             )
 
+            elapsed = time.monotonic() - t0
+
             if not response.candidates:
+                log.warning(
+                    "API call empty: page=%d, label=%s, duration=%.1fs — no candidates",
+                    page_num, label, elapsed,
+                )
                 return f"[NO RESPONSE on page {page_num}]"
 
             candidate = response.candidates[0]
             finish = getattr(candidate, "finish_reason", None)
 
             if finish and str(finish).upper() == "SAFETY":
+                log.warning(
+                    "API call blocked: page=%d, label=%s, duration=%.1fs — safety filter",
+                    page_num, label, elapsed,
+                )
                 console.print(
                     f"\n  [yellow]Page {page_num} ({label}): safety filter[/]"
                 )
                 return f"[BLOCKED BY SAFETY FILTERS on page {page_num}]"
 
             if finish and str(finish).upper() == "MAX_TOKENS":
+                log.warning(
+                    "API call truncated: page=%d, label=%s, duration=%.1fs — hit max tokens",
+                    page_num, label, elapsed,
+                )
                 console.print(
                     f"\n  [yellow]Page {page_num} ({label}): truncated[/]"
                 )
 
-            return response.text or ""
+            result_text = response.text or ""
+            log.info(
+                "API call done: page=%d, label=%s, duration=%.1fs, chars=%d, finish=%s",
+                page_num, label, elapsed, len(result_text), finish,
+            )
+            return result_text
 
         except Exception as e:
+            elapsed = time.monotonic() - t0
             err = str(e)
+
             if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                log.error(
+                    "API rate limit: page=%d, label=%s, duration=%.1fs — %s",
+                    page_num, label, elapsed, e,
+                )
                 raise RateLimitError(f"Rate limit on page {page_num} ({label}): {e}")
 
             if ("500" in err or "503" in err) and attempt < MAX_RETRIES - 1:
                 wait = (2 ** attempt) * 2
+                log.warning(
+                    "API server error: page=%d, label=%s, duration=%.1fs, "
+                    "retry in %ds (%d/%d) — %s",
+                    page_num, label, elapsed, wait, attempt + 1, MAX_RETRIES, e,
+                )
                 console.print(
                     f"\n  [yellow]Page {page_num} ({label}): server error, "
                     f"retry in {wait}s ({attempt + 1}/{MAX_RETRIES})...[/]"
@@ -543,9 +606,14 @@ def _call_gemini(
                 time.sleep(wait)
                 continue
 
+            log.error(
+                "API call failed: page=%d, label=%s, duration=%.1fs — %s",
+                page_num, label, elapsed, e,
+            )
             console.print(f"\n  [red]Page {page_num} ({label}): {e}[/]")
             return f"[OCR ERROR on page {page_num}: {e}]"
 
+    log.error("API max retries exhausted: page=%d, label=%s", page_num, label)
     return f"[OCR ERROR on page {page_num}: max retries]"
 
 
@@ -647,6 +715,9 @@ def main():
     )
 
     # --- Setup ---
+    log_path = setup_logging()
+    console.print(f"  [dim]Log: {log_path}[/]\n")
+
     api_key = load_api_key()
     client = genai.Client(api_key=api_key)
 
@@ -719,6 +790,9 @@ def main():
     num_pages = last_page - first_page + 1
     all_page_nums = list(range(first_page, last_page + 1))
 
+    log.info("PDF: %s (%s, %d total pages)", pdf_path.name, info["size"], total_pages)
+    log.info("Range: pages %d-%d (%d pages), resuming=%s", first_page, last_page, num_pages, resuming)
+
     # --- Build work list from file-based stage detection ---
     needs_ocr = []
     needs_verify = []
@@ -754,6 +828,11 @@ def main():
     # recheck-only need 1. New pages may also trigger rechecks dynamically.
     total_work = len(needs_ocr) * 2 + len(needs_verify) + len(needs_recheck)
     already_done = num_pages - len(needs_ocr) - len(needs_verify) - len(needs_recheck)
+
+    log.info(
+        "Work: ocr=%d, verify=%d, recheck=%d, done=%d, min_api_calls=%d",
+        len(needs_ocr), len(needs_verify), len(needs_recheck), already_done, total_work,
+    )
 
     console.print(
         f"\n  [bold]Page range:[/]   {first_page}-{last_page} ({num_pages} pages)"
@@ -800,6 +879,8 @@ def main():
             task = prog.add_task("Processing...", total=total_work)
 
             for page_num, start_stage in work_items:
+                log.info("--- Page %d: starting stage=%s ---", page_num, start_stage)
+
                 # --- Pass 1: OCR (if needed) ---
                 if start_stage == "ocr":
                     if api_calls_made > 0:
@@ -810,6 +891,7 @@ def main():
                     try:
                         img = convert_single_page(pdf_path, page_num)
                     except Exception as e:
+                        log.error("Page %d: image extraction failed: %s", page_num, e)
                         console.print(
                             f"\n  [red]Page {page_num}: image extraction failed: {e}[/]"
                         )
@@ -834,9 +916,11 @@ def main():
                     save_page_text(pdf_path, page_num, raw_text, STAGE_OCR)
                     save_progress_json(pdf_path, first_page, last_page)
                     prog.advance(task)
+                    log.info("Page %d: OCR saved (%d chars)", page_num, len(raw_text))
 
                     if is_page_error(raw_text):
                         # Can't verify an error — skip pass 2
+                        log.warning("Page %d: OCR returned error, skipping verify", page_num)
                         prog.advance(task)
                         del img
                         continue
@@ -883,6 +967,7 @@ def main():
                     )
                     save_progress_json(pdf_path, first_page, last_page)
                     prog.advance(task)
+                    log.info("Page %d: recheck saved (resumed, %d chars)", page_num, len(rechecked_text))
                     console.print(
                         f"\n  [dim]Page {page_num}: rechecked (resumed)[/]"
                     )
@@ -939,6 +1024,10 @@ def main():
 
                 # --- Pass 3: Recheck (if verify changed a lot) ---
                 change = compute_change_ratio(raw_text, verified_text)
+                log.info(
+                    "Page %d: verified (%d chars), change_ratio=%.2f (threshold=%.2f)",
+                    page_num, len(verified_text), change, RECHECK_THRESHOLD,
+                )
                 if change > RECHECK_THRESHOLD:
                     prog.update(
                         task,
@@ -962,6 +1051,10 @@ def main():
                         pdf_path, page_num, rechecked_text, STAGE_RECHECKED
                     )
                     save_progress_json(pdf_path, first_page, last_page)
+                    log.info(
+                        "Page %d: rechecked (%d chars, triggered by %.0f%% change)",
+                        page_num, len(rechecked_text), change * 100,
+                    )
                     console.print(
                         f"\n  [dim]Page {page_num}: rechecked "
                         f"({change:.0%} change triggered 3rd pass)[/]"
@@ -970,6 +1063,7 @@ def main():
                 del img
 
             if rate_limited:
+                log.warning("Rate limited after %d API calls", api_calls_made)
                 save_progress_json(pdf_path, first_page, last_page)
                 prog.stop()
 
@@ -1059,6 +1153,11 @@ def main():
         if get_page_stage(pdf_path, p) == STAGE_RECHECKED
     )
     all_done = n_done == num_pages and not missing
+
+    log.info(
+        "Session complete: verified=%d/%d, rechecked=%d, missing=%d, all_done=%s",
+        n_done, num_pages, n_rechecked, len(missing), all_done,
+    )
 
     lines = []
     if all_done:
