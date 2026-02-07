@@ -1,0 +1,38 @@
+# Environment & secrets
+.env
+venv/
+
+# Output files (generated, often large)
+/Output/
+
+# Source PDFs (user-provided, not distributed)
+Source/*.pdf
+
+# macOS
+.DS_Store
+
+# Claude Code
+/.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
