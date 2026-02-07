@@ -1,8 +1,26 @@
-# Akshara (अक्षर)
+<div align="center">
+  <br>
+  <img src="assets/banner.svg" alt="Akshara" width="600">
+  <br><br>
+  <p>
+    <a href="#quick-start"><img src="https://img.shields.io/badge/python-3.9+-3776ab?logo=python&logoColor=white" alt="Python 3.9+"></a>
+    &nbsp;
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"></a>
+    &nbsp;
+    <a href="https://aistudio.google.com/apikey"><img src="https://img.shields.io/badge/powered%20by-Gemini-4285F4?logo=google&logoColor=white" alt="Powered by Gemini"></a>
+  </p>
+  <p><em>Multi-pass OCR pipeline for scanned Sanskrit and Devanagari books using Google Gemini vision models.</em></p>
+</div>
 
-**LLM-powered OCR for scanned Sanskrit and Devanagari books.**
+<br>
 
-Akshara uses Google Gemini's vision models to transcribe scanned book PDFs with a multi-pass pipeline that catches the subtle errors traditional OCR misses — wrong visargas, mangled conjuncts, truncated table-of-contents lines. It saves progress after every API call, so interrupted runs resume exactly where they left off.
+Akshara uses Gemini's vision models to transcribe scanned book PDFs with a pipeline that catches the subtle errors traditional OCR misses — wrong visargas, mangled conjuncts, truncated table-of-contents lines. It saves progress after every API call, so interrupted runs resume exactly where they left off.
+
+<br>
+
+<p align="center">
+  <img src="assets/demo.svg" alt="Akshara CLI demo" width="720">
+</p>
 
 ## Features
 
@@ -39,60 +57,74 @@ The interactive CLI will prompt you to select a PDF, choose a page range, and ha
 
 ## How It Works
 
-```
-Scanned PDF Page (400 DPI image)
-        │
-        ▼
-┌─────────────────┐
-│  Pass 1: OCR    │  gemini-2.5-flash — fast text extraction
-│  (Flash)        │
-└────────┬────────┘
-         │ raw text
-         ▼
-┌─────────────────┐
-│  Pass 2: Verify │  gemini-2.5-pro + thinking budget
-│  (Pro)          │  compares text against image, fixes errors
-└────────┬────────┘
-         │ verified text
-         ▼
-    change > 20%?
-     ╱          ╲
-   yes           no
-    │             │
-    ▼             ▼
-┌──────────┐   Done ✓
-│ Pass 3:  │
-│ Recheck  │   (same model, re-verifies high-change pages)
-└────┬─────┘
-     │
-     ▼
-   Done ✓
+```mermaid
+flowchart TD
+    A["Scanned PDF Page<br/><sub>400 DPI image</sub>"] --> B["<b>Pass 1: OCR</b><br/><sub>gemini-2.5-flash</sub>"]
+    B -->|raw text| C["<b>Pass 2: Verify</b><br/><sub>gemini-2.5-pro + thinking</sub>"]
+    C -->|verified text| D{"Change > 20%?"}
+    D -->|Yes| E["<b>Pass 3: Recheck</b><br/><sub>gemini-2.5-pro + thinking</sub>"]
+    D -->|No| F(["Done"])
+    E --> F
+
+    style A fill:#1a1b26,stroke:#7aa2f7,color:#c0caf5
+    style B fill:#1a1b26,stroke:#7dcfff,color:#c0caf5
+    style C fill:#1a1b26,stroke:#bb9af7,color:#c0caf5
+    style D fill:#1a1b26,stroke:#e0af68,color:#c0caf5
+    style E fill:#1a1b26,stroke:#f7768e,color:#c0caf5
+    style F fill:#1a1b26,stroke:#9ece6a,color:#c0caf5
 ```
 
 Each page's result is saved to `Output/{book}_progress/` as it completes:
-- `page_0001_ocr.txt` → `page_0001_verified.txt` → `page_0001_rechecked.txt`
+
+```
+page_0001_ocr.txt  →  page_0001_verified.txt  →  page_0001_rechecked.txt
+     (Pass 1)              (Pass 2)                  (Pass 3, if needed)
+```
+
+## What the Verification Catches
+
+The verify pass is specifically tuned for Sanskrit/Devanagari. Here are common errors it fixes:
+
+| Error type | OCR output (Pass 1) | After verification (Pass 2) |
+|:---|:---|:---|
+| Dropped visarga (ः) | `प्रथमोध्याय` | `प्रथमोऽध्यायः` |
+| Wrong conjunct | `ग्नन्थः` | `ग्रन्थः` |
+| Missing anusvara (ं) | `ससकृतम्` | `संस्कृतम्` |
+| Swapped ट/ठ | `ठीका` | `टीका` |
+| Truncated TOC row | *(line missing)* | `विद्यामाधवीयम् .... ४२` |
 
 ## Configuration
 
 All tunables are constants at the top of `ocr_tool.py`:
 
 | Constant | Default | Description |
-|---|---|---|
-| `DPI` | 400 | Resolution for PDF page rendering |
+|:---|:---|:---|
+| `DPI` | `400` | Resolution for PDF page rendering |
 | `GEMINI_MODEL_OCR` | `gemini-2.5-flash` | Model for Pass 1 (OCR) |
 | `GEMINI_MODEL_VERIFY` | `gemini-2.5-pro` | Model for Pass 2/3 (verification) |
-| `THINKING_BUDGET_VERIFY` | 2048 | Thinking tokens for verification |
-| `RECHECK_THRESHOLD` | 0.20 | Change ratio that triggers Pass 3 |
-| `MAX_OUTPUT_TOKENS` | 16384 | Max tokens per API response |
-| `INTER_CALL_DELAY` | 2.0 | Seconds between API calls |
+| `THINKING_BUDGET_VERIFY` | `2048` | Thinking tokens for verification |
+| `RECHECK_THRESHOLD` | `0.20` | Change ratio that triggers Pass 3 |
+| `MAX_OUTPUT_TOKENS` | `16384` | Max tokens per API response |
+| `INTER_CALL_DELAY` | `2.0` | Seconds between API calls |
 
 ## Output
 
 After processing, you'll find in the `Output/` directory:
 
-- **`{book}_ocr.txt`** — Combined text of all pages, with page markers
-- **`{book}_ocr.pdf`** — Searchable PDF: original scanned images with an invisible text layer for copy/paste and search
-- **`{book}_progress/`** — Per-page intermediate files (safe to delete after you're satisfied with the output)
+```
+Output/
+├── Vidyamadhaviyam_ocr.txt          # Combined text, all pages
+├── Vidyamadhaviyam_ocr.pdf          # Searchable PDF (images + invisible text)
+└── Vidyamadhaviyam_progress/        # Per-page intermediate files
+    ├── page_0001_ocr.txt
+    ├── page_0001_verified.txt
+    ├── page_0001_rechecked.txt       # Only if Pass 3 was triggered
+    ├── page_0002_ocr.txt
+    ├── ...
+    └── progress.json                 # Summary (convenience only)
+```
+
+The `_progress/` directory is safe to delete once you're satisfied with the output.
 
 ## Requirements
 
@@ -100,15 +132,6 @@ After processing, you'll find in the `Output/` directory:
 - [Poppler](https://poppler.freedesktop.org/) (`pdfinfo` and `pdftoppm` must be on PATH)
 - A [Google Gemini API key](https://aistudio.google.com/apikey) (free tier works)
 - A Unicode font with Devanagari support (for the searchable PDF text layer — Arial Unicode MS on macOS works automatically)
-
-## Common OCR Challenges
-
-The verification pass is specifically tuned to catch these recurring issues in Sanskrit texts:
-
-- Missing or wrong **visargas** (ः), **anusvaras** (ं), **chandrabindus** (ँ)
-- Confused conjunct characters (e.g., ग्र vs ग्न, ट vs ठ)
-- Truncated lines at the end of table-of-contents pages
-- Garbled compound words (samasa) where characters merge in the scan
 
 ## License
 
