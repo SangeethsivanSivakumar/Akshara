@@ -14,6 +14,7 @@ where they left off — no wasted API calls.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import difflib
 import json
 import logging
@@ -54,9 +55,10 @@ from rich.table import Table
 DEFAULT_SOURCE_DIR = Path(__file__).parent / "Source"
 DEFAULT_OUTPUT_DIR = Path(__file__).parent / "Output"
 DPI = 400
+PDF_DPI = 200  # Lower DPI for searchable PDF background images (visual only)
 MAX_RETRIES = 3
 MAX_OUTPUT_TOKENS = 16384
-INTER_CALL_DELAY = 2.0  # Seconds between API calls
+INTER_CALL_DELAY = 1.0  # Seconds between API calls
 
 # Models — use Flash for fast OCR, Pro for accurate verification
 GEMINI_MODEL_OCR = "gemini-2.5-flash"
@@ -78,6 +80,7 @@ MAX_REASONABLE_CHARS = 8000
 GEMINI_MODEL_TRANSLATE = "gemini-2.5-pro"
 THINKING_BUDGET_TRANSLATE = 2048
 CONTEXT_WINDOW_PAGES = 3  # Include previous N pages as context
+PROGRESS_JSON_INTERVAL = 10  # Only write progress.json every N calls
 
 # Page processing stages
 STAGE_PENDING = "pending"
@@ -238,6 +241,14 @@ Instructions:
 8. Output ONLY the corrected translation. No commentary about the review process.
 """
 
+# Pre-compiled regexes for normalize_whitespace() — avoids recompilation per call
+_RE_SPACES = re.compile(r" {7,}")
+_RE_DOTS = re.compile(r"[·.…]{7,}")
+_RE_DASHES = re.compile(r"[-–—]{7,}")
+_RE_UNDERSCORES = re.compile(r"_{7,}")
+_RE_EQUALS = re.compile(r"={7,}")
+_RE_SEPARATOR_LINE = re.compile(r"[^\s.\-–—_=·…]")
+
 console = Console()
 log = logging.getLogger("akshara")
 
@@ -366,8 +377,20 @@ def is_page_error(text: str) -> bool:
     return text.startswith("[OCR ERROR") or text.startswith("[BLOCKED") or text.startswith("[GARBAGE")
 
 
-def save_progress_json(pdf_path: Path, first_page: int, last_page: int):
-    """Write a lightweight summary file (the real state lives in per-page files)."""
+_progress_json_counter = 0
+
+
+def save_progress_json(pdf_path: Path, first_page: int, last_page: int, *, force: bool = False):
+    """Write a lightweight summary file (the real state lives in per-page files).
+
+    To reduce I/O, only writes every PROGRESS_JSON_INTERVAL calls unless
+    force=True (used at rate-limit exits, final assembly, end of processing).
+    """
+    global _progress_json_counter
+    _progress_json_counter += 1
+    if not force and _progress_json_counter % PROGRESS_JSON_INTERVAL != 0:
+        return
+
     progress_dir = get_progress_dir(pdf_path)
     progress_dir.mkdir(parents=True, exist_ok=True)
 
@@ -442,20 +465,20 @@ def normalize_whitespace(text: str) -> str:
     prev_was_separator = False
     for line in lines:
         # Collapse runs of spaces longer than 6 → exactly 6
-        line = re.sub(r" {7,}", "      ", line)
+        line = _RE_SPACES.sub("      ", line)
         # Collapse runs of dots (·….) longer than 6 → 4 dots
-        line = re.sub(r"[·.…]{7,}", "....", line)
+        line = _RE_DOTS.sub("....", line)
         # Collapse runs of dashes/hyphens longer than 6 → 6
-        line = re.sub(r"[-–—]{7,}", "------", line)
+        line = _RE_DASHES.sub("------", line)
         # Collapse runs of underscores / equals longer than 6 → 6
-        line = re.sub(r"_{7,}", "______", line)
-        line = re.sub(r"={7,}", "======", line)
+        line = _RE_UNDERSCORES.sub("______", line)
+        line = _RE_EQUALS.sub("======", line)
         # Strip trailing whitespace per line
         line = line.rstrip()
 
         # Collapse consecutive "separator-only" lines (lines that are
         # nothing but dashes, dots, spaces, underscores, equals) into one.
-        is_separator = bool(line) and not re.search(r"[^\s.\-–—_=·…]", line)
+        is_separator = bool(line) and not _RE_SEPARATOR_LINE.search(line)
         if is_separator and prev_was_separator:
             continue
         prev_was_separator = is_separator
@@ -519,6 +542,16 @@ def compute_change_ratio(text_a: str, text_b: str) -> float:
     0 = identical, 1 = completely different."""
     if not text_a and not text_b:
         return 0.0
+    # Fast short-circuits for obvious cases
+    if text_a == text_b:
+        return 0.0
+    len_a, len_b = len(text_a), len(text_b)
+    if len_a == 0 or len_b == 0:
+        return 1.0
+    ratio = len_a / len_b if len_b > len_a else len_b / len_a
+    if ratio < 0.5:
+        return 0.6  # clearly above any reasonable threshold
+    # Ambiguous — use full SequenceMatcher
     matcher = difflib.SequenceMatcher(None, text_a, text_b)
     return 1.0 - matcher.ratio()
 
@@ -639,6 +672,55 @@ def convert_single_page(pdf_path: Path, page_num: int) -> Image.Image:
         str(pdf_path), dpi=DPI, first_page=page_num, last_page=page_num
     )
     return images[0]
+
+
+def _image_cache_path(pdf_path: Path, page_num: int) -> Path:
+    """Return the path for a cached PNG page image in the progress directory."""
+    return get_progress_dir(pdf_path) / f"page_{page_num:04d}.png"
+
+
+def get_page_image(pdf_path: Path, page_num: int) -> Image.Image:
+    """Get a page image, using a cached PNG if available.
+
+    First checks for a lossless PNG in the progress directory.  The cache is
+    invalidated when the source PDF's modification time is newer than the
+    cached PNG (detected via filesystem mtime comparison).  If not found or
+    stale, converts the page from the PDF at full DPI, saves the PNG, and
+    returns it.
+    """
+    cache_path = _image_cache_path(pdf_path, page_num)
+    if cache_path.exists():
+        # Invalidate cache if the source PDF was modified after the PNG was written
+        if pdf_path.stat().st_mtime <= cache_path.stat().st_mtime:
+            with Image.open(cache_path) as img:
+                return img.copy()
+        log.debug("Cache stale for page %d (PDF newer than cached PNG), regenerating", page_num)
+
+    img = convert_single_page(pdf_path, page_num)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(str(cache_path), "PNG")
+    return img
+
+
+def prune_image_cache(pdf_path: Path) -> int:
+    """Remove cached page PNG images from the progress directory.
+
+    Called after successful processing to reclaim disk space.  Returns the
+    number of files removed.
+    """
+    progress_dir = get_progress_dir(pdf_path)
+    if not progress_dir.exists():
+        return 0
+    count = 0
+    for png in progress_dir.glob("page_*.png"):
+        try:
+            png.unlink()
+            count += 1
+        except OSError as e:
+            log.warning("Could not remove cache file %s: %s", png, e)
+    if count:
+        log.info("Pruned %d cached page image(s) from %s", count, progress_dir)
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -793,7 +875,7 @@ def create_searchable_pdf(
     font_name = register_devanagari_font()
     encoding_errors = 0
 
-    first_img = convert_single_page(pdf_path, page_nums[0])
+    first_img = get_page_image(pdf_path, page_nums[0])
     iw, ih = first_img.size
     c = canvas.Canvas(
         str(output_path), pagesize=(iw * 72.0 / DPI, ih * 72.0 / DPI)
@@ -802,13 +884,19 @@ def create_searchable_pdf(
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         for page_num, text in zip(page_nums, page_texts):
-            img = convert_single_page(pdf_path, page_num)
+            img = get_page_image(pdf_path, page_num)
             iw, ih = img.size
             pw, ph = iw * 72.0 / DPI, ih * 72.0 / DPI
             c.setPageSize((pw, ph))
 
+            # Downsample to PDF_DPI for the JPEG background (visual only)
+            pdf_w = iw * PDF_DPI // DPI
+            pdf_h = ih * PDF_DPI // DPI
+            pdf_img = img.resize((pdf_w, pdf_h), Image.LANCZOS)
+
             tmp_img = Path(tmp_dir) / f"page_{page_num}.jpg"
-            img.save(str(tmp_img), "JPEG", quality=85)
+            pdf_img.save(str(tmp_img), "JPEG", quality=85)
+            del pdf_img
             c.drawImage(str(tmp_img), 0, 0, width=pw, height=ph)
 
             body = text.strip()
@@ -838,6 +926,30 @@ def create_searchable_pdf(
 # ---------------------------------------------------------------------------
 # Translation (Pass 4: Sanskrit → English)
 # ---------------------------------------------------------------------------
+
+# In-memory cache for page text lookups during translation context window.
+# Key: (pdf_path, page_num, stage), Value: text or None.
+# Cleared at the start of each process_translation() run.
+_text_cache: dict[tuple[Path, int, str], str | None] = {}
+
+
+def _cached_load_page_text(pdf_path: Path, page_num: int, stage: str) -> str | None:
+    """Load page text with in-memory caching to avoid repeated file reads."""
+    key = (pdf_path, page_num, stage)
+    if key in _text_cache:
+        return _text_cache[key]
+    text = load_page_text(pdf_path, page_num, stage)
+    _text_cache[key] = text
+    return text
+
+
+def _cached_load_best_text(pdf_path: Path, page_num: int) -> str | None:
+    """Load best available text with caching."""
+    for s in (STAGE_RECHECKED, STAGE_VERIFIED, STAGE_OCR):
+        t = _cached_load_page_text(pdf_path, page_num, s)
+        if t is not None:
+            return t
+    return None
 
 
 def translate_page(
@@ -987,6 +1099,9 @@ def process_translation(
 
     Returns True if completed, False if rate-limited or cancelled.
     """
+    # Clear the in-memory text cache for this run
+    _text_cache.clear()
+
     all_page_nums = list(range(first_page, last_page + 1))
     num_pages = len(all_page_nums)
 
@@ -1101,11 +1216,11 @@ def process_translation(
                     ctx_num = page_num - offset
                     if ctx_num >= first_page:
                         # Prefer verified translation > raw translation > Sanskrit source
-                        ctx_text = load_page_text(pdf_path, ctx_num, STAGE_TRANSLATION_VERIFIED)
+                        ctx_text = _cached_load_page_text(pdf_path, ctx_num, STAGE_TRANSLATION_VERIFIED)
                         if not ctx_text or is_page_error(ctx_text):
-                            ctx_text = load_page_text(pdf_path, ctx_num, STAGE_TRANSLATED)
+                            ctx_text = _cached_load_page_text(pdf_path, ctx_num, STAGE_TRANSLATED)
                         if not ctx_text or is_page_error(ctx_text):
-                            ctx_text = load_best_text(pdf_path, ctx_num)
+                            ctx_text = _cached_load_best_text(pdf_path, ctx_num)
                         if ctx_text and not is_page_error(ctx_text) and ctx_text.strip() != "[BLANK PAGE]":
                             context_pages.append((ctx_num, ctx_text))
 
@@ -1145,6 +1260,7 @@ def process_translation(
                     continue
 
                 save_page_text(pdf_path, page_num, translated, STAGE_TRANSLATED)
+                _text_cache[(pdf_path, page_num, STAGE_TRANSLATED)] = translated
                 save_progress_json(pdf_path, first_page, last_page)
                 prog.advance(task)
                 log.info(
@@ -1197,8 +1313,10 @@ def process_translation(
                 save_page_text(
                     pdf_path, page_num, english_text, STAGE_TRANSLATION_VERIFIED
                 )
+                _text_cache[(pdf_path, page_num, STAGE_TRANSLATION_VERIFIED)] = english_text
             else:
                 save_page_text(pdf_path, page_num, verified, STAGE_TRANSLATION_VERIFIED)
+                _text_cache[(pdf_path, page_num, STAGE_TRANSLATION_VERIFIED)] = verified
                 log.info(
                     "Page %d: translation verified (%d chars)",
                     page_num, len(verified),
@@ -1209,7 +1327,7 @@ def process_translation(
 
     if rate_limited:
         log.warning("Translation rate limited after %d calls", api_calls_made)
-        save_progress_json(pdf_path, first_page, last_page)
+        save_progress_json(pdf_path, first_page, last_page, force=True)
 
         done = sum(
             1 for p in all_page_nums
@@ -1233,6 +1351,8 @@ def process_translation(
         )
         return False
 
+    # Flush progress.json at end of translation
+    save_progress_json(pdf_path, first_page, last_page, force=True)
     return True
 
 
@@ -1334,7 +1454,7 @@ def assemble_translation_output(
 # ---------------------------------------------------------------------------
 
 
-def main():
+def main(*, keep_cache: bool = False):
     console.print(
         Panel(
             "[bold]Sanskrit OCR Tool[/]\n"
@@ -1503,6 +1623,91 @@ def main():
         rate_limited = False
         api_calls_made = 0
 
+        # Create a dedicated genai.Client for the verify worker thread so that
+        # genai.Client / client.generate_content() is never shared across
+        # threads — the main thread uses `client` for OCR, while the executor
+        # worker uses `verify_client` for verification.
+        verify_client = genai.Client(api_key=api_key)
+
+        def _do_verify(pg: int, image: Image.Image, text: str, ptype: str) -> str:
+            """Run verify in the thread pool (Pro model).
+
+            Uses *verify_client* — a per-worker genai.Client instance — to
+            avoid concurrent calls to client.generate_content() across threads.
+            """
+            return verify_page(verify_client, image, text, pg, page_type=ptype)
+
+        def _handle_verify_result(
+            pg: int, img: Image.Image, raw: str, verified_raw: str,
+            prog_obj, task_id, first_pg: int, last_pg: int,
+        ) -> bool:
+            """Process a completed verify result. Returns True if rate-limited."""
+            nonlocal api_calls_made
+            api_calls_made += 1
+
+            verified = normalize_whitespace(verified_raw)
+
+            # Quality gate
+            garbage, reason = is_garbage_output(verified)
+            if garbage:
+                log.warning("Page %d: garbage verify output — %s; keeping OCR text", pg, reason)
+                console.print(
+                    f"\n  [yellow]Page {pg}: garbage verify output ({reason}) — keeping OCR text, skipping recheck[/]"
+                )
+                save_page_text(pdf_path, pg, raw, STAGE_VERIFIED)
+                save_progress_json(pdf_path, first_pg, last_pg)
+                prog_obj.advance(task_id)
+                return False
+
+            save_page_text(pdf_path, pg, verified, STAGE_VERIFIED)
+            save_progress_json(pdf_path, first_pg, last_pg)
+            prog_obj.advance(task_id)
+
+            # --- Pass 3: Recheck (if verify changed a lot) ---
+            change = compute_change_ratio(raw, verified)
+            log.info(
+                "Page %d: verified (%d chars), change_ratio=%.2f (threshold=%.2f)",
+                pg, len(verified), change, RECHECK_THRESHOLD,
+            )
+            if change > RECHECK_THRESHOLD:
+                prog_obj.update(
+                    task_id,
+                    description=f"Page {pg}: recheck ({change:.0%} changed)...",
+                )
+                time.sleep(INTER_CALL_DELAY)
+
+                try:
+                    rechecked_text = verify_page(
+                        client, img, verified, pg,
+                        page_type=detect_page_type(raw),
+                    )
+                except RateLimitError:
+                    return True
+                api_calls_made += 1
+
+                rechecked_text = normalize_whitespace(rechecked_text)
+
+                garbage_r, reason_r = is_garbage_output(rechecked_text)
+                if garbage_r:
+                    log.warning("Page %d: garbage recheck output — %s; keeping verified text", pg, reason_r)
+                    console.print(
+                        f"\n  [yellow]Page {pg}: garbage recheck output ({reason_r}) — keeping verified text[/]"
+                    )
+                    save_page_text(pdf_path, pg, verified, STAGE_RECHECKED)
+                else:
+                    save_page_text(pdf_path, pg, rechecked_text, STAGE_RECHECKED)
+                    log.info(
+                        "Page %d: rechecked (%d chars, triggered by %.0f%% change)",
+                        pg, len(rechecked_text), change * 100,
+                    )
+                    console.print(
+                        f"\n  [dim]Page {pg}: rechecked "
+                        f"({change:.0%} change triggered 3rd pass)[/]"
+                    )
+                save_progress_json(pdf_path, first_pg, last_pg)
+
+            return False
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[bold cyan]{task.description}"),
@@ -1512,257 +1717,314 @@ def main():
         ) as prog:
             task = prog.add_task("Processing...", total=total_work)
 
-            for page_num, start_stage in work_items:
-                log.info("--- Page %d: starting stage=%s ---", page_num, start_stage)
+            # Pipeline state: pending verify future from the previous OCR page
+            pending_verify: dict | None = None  # {future, page_num, img, raw_text}
 
-                # --- Pass 1: OCR (if needed) ---
-                if start_stage == "ocr":
-                    if api_calls_made > 0:
-                        time.sleep(INTER_CALL_DELAY)
-
-                    prog.update(task, description=f"Page {page_num}: OCR...")
-
-                    try:
-                        img = convert_single_page(pdf_path, page_num)
-                    except Exception as e:
-                        log.error("Page %d: image extraction failed: %s", page_num, e)
-                        console.print(
-                            f"\n  [red]Page {page_num}: image extraction failed: {e}[/]"
-                        )
-                        save_page_text(
-                            pdf_path, page_num,
-                            f"[OCR ERROR on page {page_num}: image extraction failed]",
-                            STAGE_OCR,
-                        )
-                        save_progress_json(pdf_path, first_page, last_page)
-                        prog.advance(task, 2)  # skip both passes
-                        continue
-
-                    try:
-                        raw_text = ocr_page(client, img, page_num)
-                    except RateLimitError:
-                        del img
-                        rate_limited = True
-                        break
-                    api_calls_made += 1
-
-                    raw_len = len(raw_text)
-                    raw_text = normalize_whitespace(raw_text)
-
-                    # Quality gate: detect garbage/hallucinated OCR output
-                    garbage, reason = is_garbage_output(raw_text, raw_len=raw_len)
-                    if garbage:
-                        log.warning("Page %d: garbage OCR detected — %s", page_num, reason)
-                        console.print(
-                            f"\n  [yellow]Page {page_num}: garbage OCR detected ({reason}) — skipping verify[/]"
-                        )
-                        save_page_text(
-                            pdf_path, page_num,
-                            f"[GARBAGE OUTPUT on page {page_num}: {reason}]",
-                            STAGE_OCR,
-                        )
-                        save_progress_json(pdf_path, first_page, last_page)
-                        prog.advance(task, 2)  # skip OCR + verify progress steps
-                        del img
-                        continue
-
-                    save_page_text(pdf_path, page_num, raw_text, STAGE_OCR)
-                    save_progress_json(pdf_path, first_page, last_page)
-                    prog.advance(task)
-                    log.info("Page %d: OCR saved (%d chars)", page_num, len(raw_text))
-
-                    if is_page_error(raw_text):
-                        # Can't verify an error — skip pass 2
-                        log.warning("Page %d: OCR returned error, skipping verify", page_num)
-                        prog.advance(task)
-                        del img
-                        continue
-
-                    # Small pause between the two calls for the same page
-                    time.sleep(INTER_CALL_DELAY)
-                elif start_stage == "recheck":
-                    # Resume-only: page was verified but needs recheck
-                    try:
-                        img = convert_single_page(pdf_path, page_num)
-                    except Exception as e:
-                        console.print(
-                            f"\n  [red]Page {page_num}: image extraction failed: {e}[/]"
-                        )
-                        prog.advance(task)
-                        continue
-
-                    verified_text = load_page_text(pdf_path, page_num, STAGE_VERIFIED)
-                    if not verified_text or is_page_error(verified_text):
-                        prog.advance(task)
-                        del img
-                        continue
-
-                    if api_calls_made > 0:
-                        time.sleep(INTER_CALL_DELAY)
-
-                    page_type = detect_page_type(verified_text)
-                    prog.update(task, description=f"Page {page_num}: recheck...")
-
-                    try:
-                        rechecked_text = verify_page(
-                            client, img, verified_text, page_num,
-                            page_type=page_type,
-                        )
-                    except RateLimitError:
-                        del img
-                        rate_limited = True
-                        break
-                    api_calls_made += 1
-
-                    rechecked_text = normalize_whitespace(rechecked_text)
-
-                    # Quality gate: if recheck produced garbage, keep verified text
-                    garbage, reason = is_garbage_output(rechecked_text)
-                    if garbage:
-                        log.warning("Page %d: garbage recheck output (resumed) — %s; keeping verified text", page_num, reason)
-                        console.print(
-                            f"\n  [yellow]Page {page_num}: garbage recheck output ({reason}) — keeping verified text[/]"
-                        )
-                        save_page_text(
-                            pdf_path, page_num, verified_text, STAGE_RECHECKED
-                        )
-                        save_progress_json(pdf_path, first_page, last_page)
-                        prog.advance(task)
-                        del img
-                        continue
-
-                    save_page_text(
-                        pdf_path, page_num, rechecked_text, STAGE_RECHECKED
-                    )
-                    save_progress_json(pdf_path, first_page, last_page)
-                    prog.advance(task)
-                    log.info("Page %d: recheck saved (resumed, %d chars)", page_num, len(rechecked_text))
-                    console.print(
-                        f"\n  [dim]Page {page_num}: rechecked (resumed)[/]"
-                    )
-                    del img
-                    continue
-
-                else:
-                    # Load image + existing OCR text for verify-only pages
-                    try:
-                        img = convert_single_page(pdf_path, page_num)
-                    except Exception as e:
-                        console.print(
-                            f"\n  [red]Page {page_num}: image extraction failed: {e}[/]"
-                        )
-                        prog.advance(task)
-                        continue
-
-                    raw_text = load_page_text(pdf_path, page_num, STAGE_OCR)
-                    if not raw_text or is_page_error(raw_text):
-                        prog.advance(task)
-                        del img
-                        continue
-
-                    if api_calls_made > 0:
-                        time.sleep(INTER_CALL_DELAY)
-
-                # --- Pass 2: Verify ---
-                prog.update(task, description=f"Page {page_num}: verifying...")
-
-                # Skip verification for blank pages
-                if raw_text.strip() in ("[BLANK PAGE]", ""):
-                    save_page_text(pdf_path, page_num, raw_text.strip() or "[BLANK PAGE]", STAGE_VERIFIED)
-                    save_progress_json(pdf_path, first_page, last_page)
-                    prog.advance(task)
-                    del img
-                    continue
-
-                page_type = detect_page_type(raw_text)
-
+            def _drain_pending_verify() -> bool:
+                """Wait for and process the pending verify future. Returns True if rate-limited."""
+                nonlocal pending_verify
+                if pending_verify is None:
+                    return False
+                pv = pending_verify
+                pending_verify = None
                 try:
-                    verified_text = verify_page(
-                        client, img, raw_text, page_num, page_type=page_type
-                    )
+                    verified_raw = pv["future"].result()
                 except RateLimitError:
-                    del img
-                    rate_limited = True
-                    break
-                api_calls_made += 1
-
-                verified_text = normalize_whitespace(verified_text)
-
-                # Quality gate: if verify produced garbage, keep OCR text instead
-                garbage, reason = is_garbage_output(verified_text)
-                if garbage:
-                    log.warning("Page %d: garbage verify output — %s; keeping OCR text", page_num, reason)
-                    console.print(
-                        f"\n  [yellow]Page {page_num}: garbage verify output ({reason}) — keeping OCR text, skipping recheck[/]"
-                    )
-                    save_page_text(pdf_path, page_num, raw_text, STAGE_VERIFIED)
-                    save_progress_json(pdf_path, first_page, last_page)
-                    prog.advance(task)
-                    del img
-                    continue
-
-                save_page_text(pdf_path, page_num, verified_text, STAGE_VERIFIED)
-                save_progress_json(pdf_path, first_page, last_page)
-                prog.advance(task)
-
-                # --- Pass 3: Recheck (if verify changed a lot) ---
-                change = compute_change_ratio(raw_text, verified_text)
-                log.info(
-                    "Page %d: verified (%d chars), change_ratio=%.2f (threshold=%.2f)",
-                    page_num, len(verified_text), change, RECHECK_THRESHOLD,
+                    return True
+                return _handle_verify_result(
+                    pv["page_num"], pv["img"], pv["raw_text"], verified_raw,
+                    prog, task, first_page, last_page,
                 )
-                if change > RECHECK_THRESHOLD:
-                    prog.update(
-                        task,
-                        description=f"Page {page_num}: recheck ({change:.0%} changed)...",
-                    )
-                    time.sleep(INTER_CALL_DELAY)
 
-                    try:
-                        rechecked_text = verify_page(
-                            client, img, verified_text, page_num,
-                            page_type=page_type,
-                        )
-                    except RateLimitError:
-                        del img
-                        rate_limited = True
-                        break
-                    api_calls_made += 1
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                for page_num, start_stage in work_items:
+                    log.info("--- Page %d: starting stage=%s ---", page_num, start_stage)
 
-                    rechecked_text = normalize_whitespace(rechecked_text)
+                    # --- Pass 1: OCR (if needed) ---
+                    if start_stage == "ocr":
+                        # Drain any pending verify before starting a new OCR
+                        # (we pipeline OCR(N+1) with Verify(N), so drain N-1's verify first)
+                        if _drain_pending_verify():
+                            rate_limited = True
+                            break
 
-                    # Quality gate: if recheck produced garbage, keep verified text
-                    garbage, reason = is_garbage_output(rechecked_text)
-                    if garbage:
-                        log.warning("Page %d: garbage recheck output — %s; keeping verified text", page_num, reason)
-                        console.print(
-                            f"\n  [yellow]Page {page_num}: garbage recheck output ({reason}) — keeping verified text[/]"
-                        )
+                        if api_calls_made > 0:
+                            time.sleep(INTER_CALL_DELAY)
+
+                        prog.update(task, description=f"Page {page_num}: OCR...")
+
+                        try:
+                            img = get_page_image(pdf_path, page_num)
+                        except Exception as e:
+                            log.error("Page %d: image extraction failed: %s", page_num, e)
+                            console.print(
+                                f"\n  [red]Page {page_num}: image extraction failed: {e}[/]"
+                            )
+                            save_page_text(
+                                pdf_path, page_num,
+                                f"[OCR ERROR on page {page_num}: image extraction failed]",
+                                STAGE_OCR,
+                            )
+                            save_progress_json(pdf_path, first_page, last_page)
+                            prog.advance(task, 2)  # skip both passes
+                            continue
+
+                        try:
+                            raw_text = ocr_page(client, img, page_num)
+                        except RateLimitError:
+                            del img
+                            rate_limited = True
+                            break
+                        api_calls_made += 1
+
+                        raw_len = len(raw_text)
+                        raw_text = normalize_whitespace(raw_text)
+
+                        # Quality gate: detect garbage/hallucinated OCR output
+                        garbage, reason = is_garbage_output(raw_text, raw_len=raw_len)
+                        if garbage:
+                            log.warning("Page %d: garbage OCR detected — %s", page_num, reason)
+                            console.print(
+                                f"\n  [yellow]Page {page_num}: garbage OCR detected ({reason}) — skipping verify[/]"
+                            )
+                            save_page_text(
+                                pdf_path, page_num,
+                                f"[GARBAGE OUTPUT on page {page_num}: {reason}]",
+                                STAGE_OCR,
+                            )
+                            save_progress_json(pdf_path, first_page, last_page)
+                            prog.advance(task, 2)  # skip OCR + verify progress steps
+                            del img
+                            continue
+
+                        save_page_text(pdf_path, page_num, raw_text, STAGE_OCR)
+                        save_progress_json(pdf_path, first_page, last_page)
+                        prog.advance(task)
+                        log.info("Page %d: OCR saved (%d chars)", page_num, len(raw_text))
+
+                        if is_page_error(raw_text):
+                            log.warning("Page %d: OCR returned error, skipping verify", page_num)
+                            prog.advance(task)
+                            del img
+                            continue
+
+                        # Skip verification for blank pages
+                        if raw_text.strip() in ("[BLANK PAGE]", ""):
+                            save_page_text(pdf_path, page_num, raw_text.strip() or "[BLANK PAGE]", STAGE_VERIFIED)
+                            save_progress_json(pdf_path, first_page, last_page)
+                            prog.advance(task)
+                            del img
+                            continue
+
+                        # Submit verify to executor — it will run in parallel with the
+                        # next iteration's OCR call (different model endpoints).
+                        page_type = detect_page_type(raw_text)
+                        prog.update(task, description=f"Page {page_num}: verifying...")
+                        future = executor.submit(_do_verify, page_num, img, raw_text, page_type)
+                        pending_verify = {
+                            "future": future,
+                            "page_num": page_num,
+                            "img": img,
+                            "raw_text": raw_text,
+                        }
+                        continue
+
+                    elif start_stage == "recheck":
+                        # Must drain pipeline before recheck (sequential)
+                        if _drain_pending_verify():
+                            rate_limited = True
+                            break
+
+                        # Resume-only: page was verified but needs recheck
+                        try:
+                            img = get_page_image(pdf_path, page_num)
+                        except Exception as e:
+                            console.print(
+                                f"\n  [red]Page {page_num}: image extraction failed: {e}[/]"
+                            )
+                            prog.advance(task)
+                            continue
+
+                        verified_text = load_page_text(pdf_path, page_num, STAGE_VERIFIED)
+                        if not verified_text or is_page_error(verified_text):
+                            prog.advance(task)
+                            del img
+                            continue
+
+                        if api_calls_made > 0:
+                            time.sleep(INTER_CALL_DELAY)
+
+                        page_type = detect_page_type(verified_text)
+                        prog.update(task, description=f"Page {page_num}: recheck...")
+
+                        try:
+                            rechecked_text = verify_page(
+                                client, img, verified_text, page_num,
+                                page_type=page_type,
+                            )
+                        except RateLimitError:
+                            del img
+                            rate_limited = True
+                            break
+                        api_calls_made += 1
+
+                        rechecked_text = normalize_whitespace(rechecked_text)
+
+                        # Quality gate: if recheck produced garbage, keep verified text
+                        garbage, reason = is_garbage_output(rechecked_text)
+                        if garbage:
+                            log.warning("Page %d: garbage recheck output (resumed) — %s; keeping verified text", page_num, reason)
+                            console.print(
+                                f"\n  [yellow]Page {page_num}: garbage recheck output ({reason}) — keeping verified text[/]"
+                            )
+                            save_page_text(
+                                pdf_path, page_num, verified_text, STAGE_RECHECKED
+                            )
+                            save_progress_json(pdf_path, first_page, last_page)
+                            prog.advance(task)
+                            del img
+                            continue
+
                         save_page_text(
-                            pdf_path, page_num, verified_text, STAGE_RECHECKED
+                            pdf_path, page_num, rechecked_text, STAGE_RECHECKED
                         )
                         save_progress_json(pdf_path, first_page, last_page)
+                        prog.advance(task)
+                        log.info("Page %d: recheck saved (resumed, %d chars)", page_num, len(rechecked_text))
+                        console.print(
+                            f"\n  [dim]Page {page_num}: rechecked (resumed)[/]"
+                        )
                         del img
                         continue
 
-                    save_page_text(
-                        pdf_path, page_num, rechecked_text, STAGE_RECHECKED
-                    )
-                    save_progress_json(pdf_path, first_page, last_page)
-                    log.info(
-                        "Page %d: rechecked (%d chars, triggered by %.0f%% change)",
-                        page_num, len(rechecked_text), change * 100,
-                    )
-                    console.print(
-                        f"\n  [dim]Page {page_num}: rechecked "
-                        f"({change:.0%} change triggered 3rd pass)[/]"
-                    )
+                    else:
+                        # Must drain pipeline before verify-only (sequential)
+                        if _drain_pending_verify():
+                            rate_limited = True
+                            break
 
-                del img
+                        # Load image + existing OCR text for verify-only pages
+                        try:
+                            img = get_page_image(pdf_path, page_num)
+                        except Exception as e:
+                            console.print(
+                                f"\n  [red]Page {page_num}: image extraction failed: {e}[/]"
+                            )
+                            prog.advance(task)
+                            continue
+
+                        raw_text = load_page_text(pdf_path, page_num, STAGE_OCR)
+                        if not raw_text or is_page_error(raw_text):
+                            prog.advance(task)
+                            del img
+                            continue
+
+                        if api_calls_made > 0:
+                            time.sleep(INTER_CALL_DELAY)
+
+                        # --- Pass 2: Verify ---
+                        prog.update(task, description=f"Page {page_num}: verifying...")
+
+                        # Skip verification for blank pages
+                        if raw_text.strip() in ("[BLANK PAGE]", ""):
+                            save_page_text(pdf_path, page_num, raw_text.strip() or "[BLANK PAGE]", STAGE_VERIFIED)
+                            save_progress_json(pdf_path, first_page, last_page)
+                            prog.advance(task)
+                            del img
+                            continue
+
+                        page_type = detect_page_type(raw_text)
+
+                        try:
+                            verified_text = verify_page(
+                                client, img, raw_text, page_num, page_type=page_type
+                            )
+                        except RateLimitError:
+                            del img
+                            rate_limited = True
+                            break
+                        api_calls_made += 1
+
+                        verified_text = normalize_whitespace(verified_text)
+
+                        # Quality gate: if verify produced garbage, keep OCR text instead
+                        garbage, reason = is_garbage_output(verified_text)
+                        if garbage:
+                            log.warning("Page %d: garbage verify output — %s; keeping OCR text", page_num, reason)
+                            console.print(
+                                f"\n  [yellow]Page {page_num}: garbage verify output ({reason}) — keeping OCR text, skipping recheck[/]"
+                            )
+                            save_page_text(pdf_path, page_num, raw_text, STAGE_VERIFIED)
+                            save_progress_json(pdf_path, first_page, last_page)
+                            prog.advance(task)
+                            del img
+                            continue
+
+                        save_page_text(pdf_path, page_num, verified_text, STAGE_VERIFIED)
+                        save_progress_json(pdf_path, first_page, last_page)
+                        prog.advance(task)
+
+                        # --- Pass 3: Recheck (if verify changed a lot) ---
+                        change = compute_change_ratio(raw_text, verified_text)
+                        log.info(
+                            "Page %d: verified (%d chars), change_ratio=%.2f (threshold=%.2f)",
+                            page_num, len(verified_text), change, RECHECK_THRESHOLD,
+                        )
+                        if change > RECHECK_THRESHOLD:
+                            prog.update(
+                                task,
+                                description=f"Page {page_num}: recheck ({change:.0%} changed)...",
+                            )
+                            time.sleep(INTER_CALL_DELAY)
+
+                            try:
+                                rechecked_text = verify_page(
+                                    client, img, verified_text, page_num,
+                                    page_type=page_type,
+                                )
+                            except RateLimitError:
+                                del img
+                                rate_limited = True
+                                break
+                            api_calls_made += 1
+
+                            rechecked_text = normalize_whitespace(rechecked_text)
+
+                            garbage, reason = is_garbage_output(rechecked_text)
+                            if garbage:
+                                log.warning("Page %d: garbage recheck output — %s; keeping verified text", page_num, reason)
+                                console.print(
+                                    f"\n  [yellow]Page {page_num}: garbage recheck output ({reason}) — keeping verified text[/]"
+                                )
+                                save_page_text(
+                                    pdf_path, page_num, verified_text, STAGE_RECHECKED
+                                )
+                                save_progress_json(pdf_path, first_page, last_page)
+                                del img
+                                continue
+
+                            save_page_text(
+                                pdf_path, page_num, rechecked_text, STAGE_RECHECKED
+                            )
+                            save_progress_json(pdf_path, first_page, last_page)
+                            log.info(
+                                "Page %d: rechecked (%d chars, triggered by %.0f%% change)",
+                                page_num, len(rechecked_text), change * 100,
+                            )
+                            console.print(
+                                f"\n  [dim]Page {page_num}: rechecked "
+                                f"({change:.0%} change triggered 3rd pass)[/]"
+                            )
+
+                        del img
+
+                # Drain any remaining pending verify after loop completes
+                if not rate_limited and _drain_pending_verify():
+                    rate_limited = True
 
             if rate_limited:
                 log.warning("Rate limited after %d API calls", api_calls_made)
-                save_progress_json(pdf_path, first_page, last_page)
+                save_progress_json(pdf_path, first_page, last_page, force=True)
                 prog.stop()
 
                 # Count current state (verified/rechecked/translated = done)
@@ -1784,6 +2046,9 @@ def main():
                     )
                 )
                 return
+
+    # Flush progress.json before assembly
+    save_progress_json(pdf_path, first_page, last_page, force=True)
 
     # --- Assemble final outputs ---
     console.print()
@@ -1878,7 +2143,10 @@ def main():
 
     if all_done:
         lines.append(f"\n  [dim]Progress dir: {get_progress_dir(pdf_path)}[/]")
-        lines.append("  [dim]Safe to delete once you're happy with the output.[/]")
+        if keep_cache:
+            lines.append("  [dim]Cached page images retained (--keep-cache).[/]")
+        else:
+            lines.append("  [dim]Safe to delete once you're happy with the output.[/]")
 
     console.print()
     console.print(
@@ -1889,6 +2157,12 @@ def main():
             padding=(1, 2),
         )
     )
+
+    # Prune cached page PNGs after successful processing unless --keep-cache
+    if all_done and not keep_cache:
+        n_pruned = prune_image_cache(pdf_path)
+        if n_pruned:
+            console.print(f"  [dim]Cleaned up {n_pruned} cached page image(s).[/]")
 
     # --- Translation prompt ---
     if all_done and Confirm.ask(
@@ -1970,9 +2244,14 @@ if __name__ == "__main__":
         "--translate", action="store_true",
         help="Translation-only mode for already-OCR'd books",
     )
+    parser.add_argument(
+        "--keep-cache", action="store_true",
+        help="Retain cached page PNG images after successful processing "
+             "(by default they are pruned to save disk space)",
+    )
     args = parser.parse_args()
 
     if args.translate:
         translate_only()
     else:
-        main()
+        main(keep_cache=args.keep_cache)

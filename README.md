@@ -27,6 +27,8 @@ Akshara uses Gemini's vision models to transcribe scanned book PDFs with a pipel
 - **Multi-pass accuracy pipeline** — Fast OCR with Gemini Flash, then character-by-character verification with Gemini Pro + extended thinking. A third pass auto-triggers when verification changes more than 20% of the text.
 - **Page-type-aware prompts** — Detects tables of contents, verse pages, and prose commentary, then uses specialized verification instructions for each.
 - **Crash-proof progress** — Every page result is saved to disk immediately. Resume any interrupted run without repeating API calls.
+- **Pipelined processing** — OCR and verification calls overlap using a thread pool: while Gemini Pro verifies page N, Gemini Flash OCRs page N+1. Same API calls, less wall-clock time.
+- **Image caching** — Page images are cached as lossless PNGs in the progress directory. Resuming a run skips PDF-to-image conversion entirely. Caches auto-invalidate if the source PDF changes, and are pruned after successful processing (retain with `--keep-cache`).
 - **Dual output** — Produces both a plain text file and a searchable PDF (scanned images with invisible text overlay).
 - **Sanskrit-to-English translation** — Translates OCR'd text using Gemini Pro with a sliding window of previous pages for terminology continuity. Each translation is verified against the Sanskrit source.
 - **Rate limit handling** — Detects API rate limits, saves all progress, and exits cleanly so you can resume later.
@@ -55,6 +57,9 @@ python ocr_tool.py
 
 # 5. Translate an already-OCR'd book to English
 python ocr_tool.py --translate
+
+# 6. Keep cached page images after processing (skipped by default)
+python ocr_tool.py --keep-cache
 ```
 
 The interactive CLI will prompt you to select a PDF, choose a page range, and handle any existing progress.
@@ -72,8 +77,9 @@ python ocr_tool.py --help
 
 ```mermaid
 flowchart TD
-    A["Scanned PDF Page<br/><sub>400 DPI image</sub>"] --> B["<b>Pass 1: OCR</b><br/><sub>gemini-2.5-flash</sub>"]
-    B -->|raw text| C["<b>Pass 2: Verify</b><br/><sub>gemini-2.5-pro + thinking</sub>"]
+    A["Scanned PDF Page<br/><sub>400 DPI image</sub>"] --> CA["<b>Image Cache</b><br/><sub>PNG in progress dir</sub>"]
+    CA --> B["<b>Pass 1: OCR</b><br/><sub>gemini-2.5-flash</sub>"]
+    B -->|"raw text<br/><sub>⚡ pipeline: OCR(N+1) overlaps Verify(N)</sub>"| C["<b>Pass 2: Verify</b><br/><sub>gemini-2.5-pro + thinking</sub>"]
     C -->|verified text| D{"Change > 20%?"}
     D -->|Yes| E["<b>Pass 3: Recheck</b><br/><sub>gemini-2.5-pro + thinking</sub>"]
     D -->|No| F["<b>Pass 4: Translate</b><br/><sub>gemini-2.5-pro + thinking</sub>"]
@@ -82,6 +88,7 @@ flowchart TD
     G --> H(["Done"])
 
     style A fill:#1a1b26,stroke:#7aa2f7,color:#c0caf5
+    style CA fill:#1a1b26,stroke:#565f89,color:#c0caf5
     style B fill:#1a1b26,stroke:#7dcfff,color:#c0caf5
     style C fill:#1a1b26,stroke:#bb9af7,color:#c0caf5
     style D fill:#1a1b26,stroke:#e0af68,color:#c0caf5
@@ -125,7 +132,9 @@ All tunables are constants at the top of `ocr_tool.py`:
 | `THINKING_BUDGET_VERIFY` | `2048` | Thinking tokens for verification |
 | `RECHECK_THRESHOLD` | `0.20` | Change ratio that triggers Pass 3 |
 | `MAX_OUTPUT_TOKENS` | `16384` | Max tokens per API response |
-| `INTER_CALL_DELAY` | `2.0` | Seconds between API calls |
+| `INTER_CALL_DELAY` | `1.0` | Seconds between API calls |
+| `PDF_DPI` | `200` | Resolution for searchable PDF background images |
+| `PROGRESS_JSON_INTERVAL` | `10` | Write progress.json every N API calls |
 | `GEMINI_MODEL_TRANSLATE` | `gemini-2.5-pro` | Model for translation passes |
 | `THINKING_BUDGET_TRANSLATE` | `2048` | Thinking tokens for translation |
 | `CONTEXT_WINDOW_PAGES` | `3` | Previous pages included as translation context |
@@ -141,11 +150,13 @@ Output/
 ├── Vidyamadhaviyam_translation.txt      # Combined English translation
 ├── Vidyamadhaviyam_translation.pdf      # English translation PDF (readable text)
 └── Vidyamadhaviyam_progress/            # Per-page intermediate files
+    ├── page_0001.png                        # Cached page image (pruned after processing)
     ├── page_0001_ocr.txt
     ├── page_0001_verified.txt
     ├── page_0001_rechecked.txt              # Only if Pass 3 was triggered
     ├── page_0001_translated.txt             # English translation
     ├── page_0001_translation_verified.txt   # Verified translation
+    ├── page_0002.png
     ├── page_0002_ocr.txt
     ├── ...
     └── progress.json                        # Summary (convenience only)
