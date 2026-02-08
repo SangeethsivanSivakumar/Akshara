@@ -28,6 +28,7 @@ Akshara uses Gemini's vision models to transcribe scanned book PDFs with a pipel
 - **Page-type-aware prompts** — Detects tables of contents, verse pages, and prose commentary, then uses specialized verification instructions for each.
 - **Crash-proof progress** — Every page result is saved to disk immediately. Resume any interrupted run without repeating API calls.
 - **Dual output** — Produces both a plain text file and a searchable PDF (scanned images with invisible text overlay).
+- **Sanskrit-to-English translation** — Translates OCR'd text using Gemini Pro with a sliding window of previous pages for terminology continuity. Each translation is verified against the Sanskrit source.
 - **Rate limit handling** — Detects API rate limits, saves all progress, and exits cleanly so you can resume later.
 
 ## Quick Start
@@ -51,9 +52,21 @@ cp .env.example .env
 # 4. Place PDFs in Source/ and run
 mkdir -p Source
 python ocr_tool.py
+
+# 5. Translate an already-OCR'd book to English
+python ocr_tool.py --translate
 ```
 
 The interactive CLI will prompt you to select a PDF, choose a page range, and handle any existing progress.
+
+**Translation workflows:**
+
+- **After OCR** — When all pages in the selected range are fully verified, the CLI will ask *"Translate to English?"* (defaults to no). Accepting starts translation immediately using the same session.
+- **Standalone (`--translate`)** — Runs translation on a book that has already been OCR'd. The tool detects the page range from existing progress files. If the selected PDF has no OCR progress, it exits with an error (*"No OCR progress found for this PDF. Run OCR first."*) — it will not automatically run OCR.
+
+```
+python ocr_tool.py --help
+```
 
 ## How It Works
 
@@ -63,15 +76,19 @@ flowchart TD
     B -->|raw text| C["<b>Pass 2: Verify</b><br/><sub>gemini-2.5-pro + thinking</sub>"]
     C -->|verified text| D{"Change > 20%?"}
     D -->|Yes| E["<b>Pass 3: Recheck</b><br/><sub>gemini-2.5-pro + thinking</sub>"]
-    D -->|No| F(["Done"])
+    D -->|No| F["<b>Pass 4: Translate</b><br/><sub>gemini-2.5-pro + thinking</sub>"]
     E --> F
+    F -->|English draft| G["<b>Pass 5: Verify Translation</b><br/><sub>gemini-2.5-pro + thinking</sub>"]
+    G --> H(["Done"])
 
     style A fill:#1a1b26,stroke:#7aa2f7,color:#c0caf5
     style B fill:#1a1b26,stroke:#7dcfff,color:#c0caf5
     style C fill:#1a1b26,stroke:#bb9af7,color:#c0caf5
     style D fill:#1a1b26,stroke:#e0af68,color:#c0caf5
     style E fill:#1a1b26,stroke:#f7768e,color:#c0caf5
-    style F fill:#1a1b26,stroke:#9ece6a,color:#c0caf5
+    style F fill:#1a1b26,stroke:#73daca,color:#c0caf5
+    style G fill:#1a1b26,stroke:#ff9e64,color:#c0caf5
+    style H fill:#1a1b26,stroke:#9ece6a,color:#c0caf5
 ```
 
 Each page's result is saved to `Output/{book}_progress/` as it completes:
@@ -79,6 +96,9 @@ Each page's result is saved to `Output/{book}_progress/` as it completes:
 ```
 page_0001_ocr.txt  →  page_0001_verified.txt  →  page_0001_rechecked.txt
      (Pass 1)              (Pass 2)                  (Pass 3, if needed)
+
+page_0001_translated.txt  →  page_0001_translation_verified.txt
+        (Pass 4)                       (Pass 5)
 ```
 
 ## What the Verification Catches
@@ -106,6 +126,9 @@ All tunables are constants at the top of `ocr_tool.py`:
 | `RECHECK_THRESHOLD` | `0.20` | Change ratio that triggers Pass 3 |
 | `MAX_OUTPUT_TOKENS` | `16384` | Max tokens per API response |
 | `INTER_CALL_DELAY` | `2.0` | Seconds between API calls |
+| `GEMINI_MODEL_TRANSLATE` | `gemini-2.5-pro` | Model for translation passes |
+| `THINKING_BUDGET_TRANSLATE` | `2048` | Thinking tokens for translation |
+| `CONTEXT_WINDOW_PAGES` | `3` | Previous pages included as translation context |
 
 ## Output
 
@@ -113,15 +136,19 @@ After processing, you'll find in the `Output/` directory:
 
 ```
 Output/
-├── Vidyamadhaviyam_ocr.txt          # Combined text, all pages
-├── Vidyamadhaviyam_ocr.pdf          # Searchable PDF (images + invisible text)
-└── Vidyamadhaviyam_progress/        # Per-page intermediate files
+├── Vidyamadhaviyam_ocr.txt              # Combined Sanskrit text, all pages
+├── Vidyamadhaviyam_ocr.pdf              # Searchable PDF (images + invisible text)
+├── Vidyamadhaviyam_translation.txt      # Combined English translation
+├── Vidyamadhaviyam_translation.pdf      # English translation PDF (readable text)
+└── Vidyamadhaviyam_progress/            # Per-page intermediate files
     ├── page_0001_ocr.txt
     ├── page_0001_verified.txt
-    ├── page_0001_rechecked.txt       # Only if Pass 3 was triggered
+    ├── page_0001_rechecked.txt              # Only if Pass 3 was triggered
+    ├── page_0001_translated.txt             # English translation
+    ├── page_0001_translation_verified.txt   # Verified translation
     ├── page_0002_ocr.txt
     ├── ...
-    └── progress.json                 # Summary (convenience only)
+    └── progress.json                        # Summary (convenience only)
 ```
 
 The `_progress/` directory is safe to delete once you're satisfied with the output.

@@ -13,6 +13,7 @@ where they left off — no wasted API calls.
 
 from __future__ import annotations
 
+import argparse
 import difflib
 import json
 import logging
@@ -69,11 +70,22 @@ THINKING_BUDGET_VERIFY = 2048
 # automatically trigger a third "recheck" pass.
 RECHECK_THRESHOLD = 0.20
 
+# Quality gate: normal Sanskrit book pages produce 500–2000 chars.
+# Anything above this after normalization is suspicious hallucination.
+MAX_REASONABLE_CHARS = 8000
+
+# Translation — Pro model with thinking for context-aware Sanskrit→English
+GEMINI_MODEL_TRANSLATE = "gemini-2.5-pro"
+THINKING_BUDGET_TRANSLATE = 2048
+CONTEXT_WINDOW_PAGES = 3  # Include previous N pages as context
+
 # Page processing stages
 STAGE_PENDING = "pending"
 STAGE_OCR = "ocr"
 STAGE_VERIFIED = "verified"
 STAGE_RECHECKED = "rechecked"
+STAGE_TRANSLATED = "translated"
+STAGE_TRANSLATION_VERIFIED = "translation_verified"
 
 # ---------------------------------------------------------------------------
 # Prompts
@@ -152,6 +164,79 @@ Instructions:
    whitespace padding.
 5. Output ONLY the corrected transcription. No commentary or notes.
 6. If the transcription is already correct, output it unchanged."""
+
+# ---------------------------------------------------------------------------
+# Translation prompts
+# ---------------------------------------------------------------------------
+
+TRANSLATE_SYSTEM_INSTRUCTION = (
+    "You are an expert Sanskrit-to-English translator specialising in classical "
+    "Sanskrit literature, Jyotish Shastra (Vedic astrology), and Indian philosophy. "
+    "You produce scholarly, readable English translations that preserve the meaning, "
+    "structure, and nuance of the original Sanskrit text."
+)
+
+TRANSLATE_PROMPT_TEMPLATE = """\
+Translate the Sanskrit text below into clear, scholarly English.
+
+{context_section}
+=== CURRENT PAGE (Page {page_num}) ===
+{sanskrit_text}
+=== END CURRENT PAGE ===
+
+Instructions:
+1. Translate the CURRENT PAGE text into fluent, readable English.
+2. Use the previous pages as context to maintain continuity of subjects,
+   terminology, and narrative flow. Do NOT re-translate the context pages.
+3. Preserve the structure: verse numbers, section headings, formatting.
+4. For technical Sanskrit terms (philosophical, grammatical, astrological),
+   provide the Sanskrit term in parentheses on first occurrence in each page.
+5. For verses (śloka), maintain verse structure with line breaks.
+6. For commentary (ṭīkā/bhāṣya), use clear paragraph breaks.
+7. Translate quotations from other texts as quotes, citing the author if named.
+8. Output ONLY the English translation. No commentary about the translation process.
+9. If the page is marked [BLANK PAGE], output exactly: [BLANK PAGE]"""
+
+CONTEXT_SECTION_TEMPLATE = """\
+=== PREVIOUS PAGES (for context only — do NOT re-translate) ===
+{context_text}
+=== END PREVIOUS PAGES ===
+
+"""
+
+# ---------------------------------------------------------------------------
+# Translation verification prompts
+# ---------------------------------------------------------------------------
+
+VERIFY_TRANSLATION_SYSTEM_INSTRUCTION = (
+    "You are an expert Sanskrit-to-English translation reviewer specialising in "
+    "classical Sanskrit literature, Jyotish Shastra (Vedic astrology), and Indian "
+    "philosophy. You verify translations for accuracy, completeness, and scholarly quality."
+)
+
+VERIFY_TRANSLATION_PROMPT_TEMPLATE = """\
+Below is a Sanskrit source text and its English translation. Compare the translation
+against the original Sanskrit and correct any errors.
+
+=== SANSKRIT SOURCE (Page {page_num}) ===
+{sanskrit_text}
+=== END SANSKRIT SOURCE ===
+
+=== ENGLISH TRANSLATION ===
+{english_text}
+=== END ENGLISH TRANSLATION ===
+
+Instructions:
+1. Compare each sentence/verse of the English translation against the Sanskrit original.
+2. Fix any errors in meaning, missing passages, or mistranslations.
+3. Ensure technical Sanskrit terms are transliterated correctly and provided in
+   parentheses where appropriate (e.g., navāṃśa, daśā, graha).
+4. Verify verse numbers, section headings, and structural formatting are preserved.
+5. Ensure consistency of terminology (same Sanskrit term → same English rendering).
+6. Maintain the scholarly, readable tone of the original translation.
+7. If the translation is already correct, output it unchanged.
+8. Output ONLY the corrected translation. No commentary about the review process.
+"""
 
 console = Console()
 log = logging.getLogger("akshara")
@@ -233,6 +318,8 @@ def _page_file(pdf_path: Path, page_num: int, stage: str) -> Path:
         STAGE_OCR: "_ocr",
         STAGE_VERIFIED: "_verified",
         STAGE_RECHECKED: "_rechecked",
+        STAGE_TRANSLATED: "_translated",
+        STAGE_TRANSLATION_VERIFIED: "_translation_verified",
     }
     suffix = suffix_map.get(stage, "_verified")
     return get_progress_dir(pdf_path) / f"page_{page_num:04d}{suffix}.txt"
@@ -240,6 +327,10 @@ def _page_file(pdf_path: Path, page_num: int, stage: str) -> Path:
 
 def get_page_stage(pdf_path: Path, page_num: int) -> str:
     """Determine how far a page has been processed based on saved files."""
+    if _page_file(pdf_path, page_num, STAGE_TRANSLATION_VERIFIED).exists():
+        return STAGE_TRANSLATION_VERIFIED
+    if _page_file(pdf_path, page_num, STAGE_TRANSLATED).exists():
+        return STAGE_TRANSLATED
     if _page_file(pdf_path, page_num, STAGE_RECHECKED).exists():
         return STAGE_RECHECKED
     if _page_file(pdf_path, page_num, STAGE_VERIFIED).exists():
@@ -272,7 +363,7 @@ def load_best_text(pdf_path: Path, page_num: int) -> str | None:
 
 
 def is_page_error(text: str) -> bool:
-    return text.startswith("[OCR ERROR") or text.startswith("[BLOCKED")
+    return text.startswith("[OCR ERROR") or text.startswith("[BLOCKED") or text.startswith("[GARBAGE")
 
 
 def save_progress_json(pdf_path: Path, first_page: int, last_page: int):
@@ -343,19 +434,65 @@ def load_progress_json(pdf_path: Path) -> dict | None:
 
 
 def normalize_whitespace(text: str) -> str:
-    """Collapse excessive horizontal whitespace that some OCR outputs produce,
-    while preserving intentional layout (indentation, column gaps)."""
+    """Collapse excessive repeated characters that OCR sometimes produces
+    (e.g. thousands of dashes for a decorative rule), while preserving
+    intentional layout (indentation, column gaps)."""
     lines = text.split("\n")
     cleaned = []
+    prev_was_separator = False
     for line in lines:
         # Collapse runs of spaces longer than 6 → exactly 6
         line = re.sub(r" {7,}", "      ", line)
         # Collapse runs of dots (·….) longer than 6 → 4 dots
         line = re.sub(r"[·.…]{7,}", "....", line)
+        # Collapse runs of dashes/hyphens longer than 6 → 6
+        line = re.sub(r"[-–—]{7,}", "------", line)
+        # Collapse runs of underscores / equals longer than 6 → 6
+        line = re.sub(r"_{7,}", "______", line)
+        line = re.sub(r"={7,}", "======", line)
         # Strip trailing whitespace per line
         line = line.rstrip()
+
+        # Collapse consecutive "separator-only" lines (lines that are
+        # nothing but dashes, dots, spaces, underscores, equals) into one.
+        is_separator = bool(line) and not re.search(r"[^\s.\-–—_=·…]", line)
+        if is_separator and prev_was_separator:
+            continue
+        prev_was_separator = is_separator
+
         cleaned.append(line)
     return "\n".join(cleaned)
+
+
+def is_garbage_output(text: str, raw_len: int | None = None) -> tuple[bool, str]:
+    """Detect hallucinated or garbage OCR output that would waste downstream API calls.
+
+    Returns (is_garbage, reason). Checks raw size, normalized size,
+    separator dominance, and character diversity.
+    """
+    # Check raw (pre-normalization) size — catches massive hallucinations
+    if raw_len is not None and raw_len > MAX_REASONABLE_CHARS * 5:
+        return True, f"raw output too large ({raw_len:,} chars, limit {MAX_REASONABLE_CHARS * 5:,})"
+
+    # Check normalized size
+    if len(text) > MAX_REASONABLE_CHARS:
+        return True, f"normalized output too large ({len(text):,} chars, limit {MAX_REASONABLE_CHARS:,})"
+
+    # Check separator dominance: if >80% of non-whitespace chars are separators,
+    # the page is a decorative element, not text
+    non_ws = re.sub(r"\s", "", text)
+    if len(non_ws) > 50:
+        separators = sum(1 for c in non_ws if c in ".-–—_=·…")
+        if separators / len(non_ws) > 0.80:
+            return True, f"separator dominance ({separators}/{len(non_ws)} = {separators/len(non_ws):.0%} separators)"
+
+    # Check character diversity: if >100 non-ws chars but <1% unique, it's repetitive
+    if len(non_ws) > 100:
+        unique_ratio = len(set(non_ws)) / len(non_ws)
+        if unique_ratio < 0.01:
+            return True, f"low character diversity ({len(set(non_ws))} unique in {len(non_ws)} chars = {unique_ratio:.2%})"
+
+    return False, ""
 
 
 def detect_page_type(text: str) -> str:
@@ -699,6 +836,500 @@ def create_searchable_pdf(
 
 
 # ---------------------------------------------------------------------------
+# Translation (Pass 4: Sanskrit → English)
+# ---------------------------------------------------------------------------
+
+
+def translate_page(
+    client: genai.Client,
+    sanskrit_text: str,
+    page_num: int,
+    context_pages: list[tuple[int, str]] | None = None,
+) -> str:
+    """Pass 4 — translate Sanskrit to English with sliding window context."""
+    context_section = ""
+    if context_pages:
+        parts = []
+        for ctx_num, ctx_text in context_pages:
+            parts.append(f"--- Page {ctx_num} ---\n{ctx_text}")
+        context_section = CONTEXT_SECTION_TEMPLATE.format(
+            context_text="\n\n".join(parts)
+        )
+
+    prompt = TRANSLATE_PROMPT_TEMPLATE.format(
+        context_section=context_section,
+        page_num=page_num,
+        sanskrit_text=sanskrit_text,
+    )
+
+    return _call_gemini(
+        client, [prompt], TRANSLATE_SYSTEM_INSTRUCTION, page_num, "translate",
+        model=GEMINI_MODEL_TRANSLATE,
+        thinking_budget=THINKING_BUDGET_TRANSLATE,
+    )
+
+
+def verify_translation(
+    client: genai.Client, sanskrit_text: str, english_text: str, page_num: int,
+) -> str:
+    """Pass 5 — verify translation against Sanskrit source."""
+    prompt = VERIFY_TRANSLATION_PROMPT_TEMPLATE.format(
+        page_num=page_num,
+        sanskrit_text=sanskrit_text,
+        english_text=english_text,
+    )
+    return _call_gemini(
+        client, [prompt], VERIFY_TRANSLATION_SYSTEM_INSTRUCTION,
+        page_num, "verify_translation",
+        model=GEMINI_MODEL_TRANSLATE,
+        thinking_budget=THINKING_BUDGET_TRANSLATE,
+    )
+
+
+def _start_continuation_page(
+    c: canvas.Canvas,
+    page_w: float,
+    page_h: float,
+    margin: float,
+    page_num: int,
+    font_name: str,
+    font_size: int,
+) -> float:
+    """Start a new PDF continuation page with a gray header."""
+    c.showPage()
+    c.setFont(font_name, 9)
+    c.setFillColorRGB(0.4, 0.4, 0.4)
+    c.drawRightString(page_w - margin, page_h - 50, f"Page {page_num} (cont.)")
+    c.setFillColorRGB(0, 0, 0)
+    c.setFont(font_name, font_size)
+    return page_h - margin
+
+
+def create_text_pdf(
+    output_path: Path,
+    page_nums: list[int],
+    page_texts: list[str],
+) -> None:
+    """Create a text-only English PDF with visible text and page breaks."""
+    if not page_nums:
+        return
+
+    page_w, page_h = 8.5 * 72, 11 * 72  # US Letter
+    margin = 72  # 1 inch all around
+    font_name = "Helvetica"
+    font_size = 11
+    leading = 14  # line spacing
+    max_text_w = page_w - 2 * margin
+
+    c = canvas.Canvas(str(output_path), pagesize=(page_w, page_h))
+
+    for page_num, text in zip(page_nums, page_texts):
+        body = text.strip()
+
+        # Page header
+        c.setFont(font_name, 9)
+        c.setFillColorRGB(0.4, 0.4, 0.4)
+        c.drawRightString(page_w - margin, page_h - 50, f"Page {page_num}")
+        c.setFillColorRGB(0, 0, 0)
+
+        if not body or body == "[BLANK PAGE]":
+            c.setFont(font_name, 12)
+            c.drawCentredString(page_w / 2, page_h / 2, "[BLANK PAGE]")
+            c.showPage()
+            continue
+
+        # Render text with word wrapping
+        y = page_h - margin
+        c.setFont(font_name, font_size)
+
+        for line in body.split("\n"):
+            if not line.strip():
+                # Blank line — add spacing
+                y -= leading
+                if y < margin:
+                    y = _start_continuation_page(c, page_w, page_h, margin, page_num, font_name, font_size)
+                continue
+
+            # Word-wrap the line
+            words = line.split()
+            current = ""
+            for word in words:
+                test = f"{current} {word}".strip()
+                if c.stringWidth(test, font_name, font_size) <= max_text_w:
+                    current = test
+                else:
+                    if current:
+                        c.drawString(margin, y, current)
+                        y -= leading
+                        if y < margin:
+                            y = _start_continuation_page(c, page_w, page_h, margin, page_num, font_name, font_size)
+                    current = word
+
+            if current:
+                c.drawString(margin, y, current)
+                y -= leading
+                if y < margin:
+                    y = _start_continuation_page(c, page_w, page_h, margin, page_num, font_name, font_size)
+
+        c.showPage()
+
+    c.save()
+
+
+def process_translation(
+    client: genai.Client,
+    pdf_path: Path,
+    first_page: int,
+    last_page: int,
+) -> bool:
+    """Translate OCR'd pages to English with sliding window context,
+    then verify each translation against the Sanskrit source.
+
+    Returns True if completed, False if rate-limited or cancelled.
+    """
+    all_page_nums = list(range(first_page, last_page + 1))
+    num_pages = len(all_page_nums)
+
+    # Build work list — determine what each page needs
+    needs_translate = []   # needs translate + verify (2 API calls)
+    needs_verify = []      # has _translated.txt but no _translation_verified.txt (1 call)
+    already_done = 0
+    no_source = []
+
+    for p in all_page_nums:
+        verified = load_page_text(pdf_path, p, STAGE_TRANSLATION_VERIFIED)
+        if verified is not None:
+            already_done += 1
+            continue
+
+        translated = load_page_text(pdf_path, p, STAGE_TRANSLATED)
+        if translated is not None:
+            if is_page_error(translated):
+                already_done += 1  # error page, nothing more to do
+            else:
+                needs_verify.append(p)
+            continue
+
+        source = load_best_text(pdf_path, p)
+        if source and not is_page_error(source):
+            needs_translate.append(p)
+        else:
+            no_source.append(p)
+
+    total_api_calls = len(needs_translate) * 2 + len(needs_verify)
+
+    console.print(
+        f"\n  [bold]Translation Status:[/]\n"
+        f"  [bold]Pages to translate:[/]      {len(needs_translate)}"
+    )
+    if needs_verify:
+        console.print(
+            f"  [bold]Pages to verify only:[/]   {len(needs_verify)}"
+        )
+    console.print(
+        f"  [bold]Already done:[/]            {already_done}\n"
+        f"  [bold]No source text:[/]          {len(no_source)}\n"
+        f"  [bold]API calls needed:[/]        {total_api_calls}"
+    )
+
+    if no_source:
+        console.print(
+            f"  [yellow]{len(no_source)} page(s) have no OCR text — "
+            f"run OCR first.[/]"
+        )
+
+    if not needs_translate and not needs_verify:
+        console.print("\n  [green]All pages already translated and verified![/]")
+        return True
+
+    if not Confirm.ask(
+        f"\n  [bold]Start translation?[/] ({total_api_calls} API calls)",
+        default=True,
+    ):
+        console.print("\n  [dim]Cancelled.[/]")
+        return False
+
+    # Build work items: (page_num, start_stage) sorted by page number
+    work_items: list[tuple[int, str]] = []
+    for p in needs_translate:
+        work_items.append((p, "translate"))
+    for p in needs_verify:
+        work_items.append((p, "verify_only"))
+    work_items.sort(key=lambda x: x[0])
+
+    console.print()
+    rate_limited = False
+    api_calls_made = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+    ) as prog:
+        task = prog.add_task("Translating...", total=total_api_calls)
+
+        for page_num, start_stage in work_items:
+            source_text = load_best_text(pdf_path, page_num)
+            if not source_text or is_page_error(source_text):
+                # Skip pages without usable source
+                if start_stage == "translate":
+                    prog.advance(task, 2)
+                else:
+                    prog.advance(task)
+                continue
+
+            # --- Translate step (if needed) ---
+            if start_stage == "translate":
+                if api_calls_made > 0:
+                    time.sleep(INTER_CALL_DELAY)
+
+                prog.update(task, description=f"Page {page_num}: translating...")
+
+                # Blank pages — skip both translate and verify
+                if source_text.strip() == "[BLANK PAGE]":
+                    save_page_text(pdf_path, page_num, "[BLANK PAGE]", STAGE_TRANSLATED)
+                    save_page_text(pdf_path, page_num, "[BLANK PAGE]", STAGE_TRANSLATION_VERIFIED)
+                    save_progress_json(pdf_path, first_page, last_page)
+                    prog.advance(task, 2)
+                    continue
+
+                # Build context window (previous N pages, oldest first)
+                context_pages = []
+                for offset in range(CONTEXT_WINDOW_PAGES, 0, -1):
+                    ctx_num = page_num - offset
+                    if ctx_num >= first_page:
+                        # Prefer verified translation > raw translation > Sanskrit source
+                        ctx_text = load_page_text(pdf_path, ctx_num, STAGE_TRANSLATION_VERIFIED)
+                        if not ctx_text or is_page_error(ctx_text):
+                            ctx_text = load_page_text(pdf_path, ctx_num, STAGE_TRANSLATED)
+                        if not ctx_text or is_page_error(ctx_text):
+                            ctx_text = load_best_text(pdf_path, ctx_num)
+                        if ctx_text and not is_page_error(ctx_text) and ctx_text.strip() != "[BLANK PAGE]":
+                            context_pages.append((ctx_num, ctx_text))
+
+                log.info(
+                    "Translation: page=%d, context=%s",
+                    page_num, [p for p, _ in context_pages] or "none",
+                )
+
+                try:
+                    translated = translate_page(
+                        client, source_text, page_num, context_pages=context_pages
+                    )
+                except RateLimitError:
+                    rate_limited = True
+                    break
+                api_calls_made += 1
+
+                translated = normalize_whitespace(translated)
+
+                # Quality gate
+                garbage, reason = is_garbage_output(translated)
+                if garbage:
+                    log.warning(
+                        "Page %d: garbage translation — %s", page_num, reason
+                    )
+                    console.print(
+                        f"\n  [yellow]Page {page_num}: garbage translation "
+                        f"({reason})[/]"
+                    )
+                    save_page_text(
+                        pdf_path, page_num,
+                        f"[GARBAGE OUTPUT on page {page_num}: translation {reason}]",
+                        STAGE_TRANSLATED,
+                    )
+                    save_progress_json(pdf_path, first_page, last_page)
+                    prog.advance(task, 2)  # skip both translate + verify progress
+                    continue
+
+                save_page_text(pdf_path, page_num, translated, STAGE_TRANSLATED)
+                save_progress_json(pdf_path, first_page, last_page)
+                prog.advance(task)
+                log.info(
+                    "Page %d: translation saved (%d chars)", page_num, len(translated)
+                )
+
+                # Fall through to verify step below
+                time.sleep(INTER_CALL_DELAY)
+
+            # --- Verify translation step ---
+            english_text = load_page_text(pdf_path, page_num, STAGE_TRANSLATED)
+            if not english_text or is_page_error(english_text):
+                prog.advance(task)
+                continue
+
+            # Blank pages — just promote
+            if english_text.strip() == "[BLANK PAGE]":
+                save_page_text(pdf_path, page_num, "[BLANK PAGE]", STAGE_TRANSLATION_VERIFIED)
+                save_progress_json(pdf_path, first_page, last_page)
+                prog.advance(task)
+                continue
+
+            if start_stage == "verify_only" and api_calls_made > 0:
+                time.sleep(INTER_CALL_DELAY)
+
+            prog.update(task, description=f"Page {page_num}: verifying translation...")
+
+            try:
+                verified = verify_translation(
+                    client, source_text, english_text, page_num
+                )
+            except RateLimitError:
+                rate_limited = True
+                break
+            api_calls_made += 1
+
+            verified = normalize_whitespace(verified)
+
+            # Quality gate — if verify produced garbage, keep original translation
+            garbage, reason = is_garbage_output(verified)
+            if garbage:
+                log.warning(
+                    "Page %d: garbage translation verify — %s; keeping original",
+                    page_num, reason,
+                )
+                console.print(
+                    f"\n  [yellow]Page {page_num}: garbage verify output "
+                    f"({reason}) — keeping original translation[/]"
+                )
+                save_page_text(
+                    pdf_path, page_num, english_text, STAGE_TRANSLATION_VERIFIED
+                )
+            else:
+                save_page_text(pdf_path, page_num, verified, STAGE_TRANSLATION_VERIFIED)
+                log.info(
+                    "Page %d: translation verified (%d chars)",
+                    page_num, len(verified),
+                )
+
+            save_progress_json(pdf_path, first_page, last_page)
+            prog.advance(task)
+
+    if rate_limited:
+        log.warning("Translation rate limited after %d calls", api_calls_made)
+        save_progress_json(pdf_path, first_page, last_page)
+
+        done = sum(
+            1 for p in all_page_nums
+            if load_page_text(pdf_path, p, STAGE_TRANSLATION_VERIFIED) is not None
+        )
+        translated_count = sum(
+            1 for p in all_page_nums
+            if load_page_text(pdf_path, p, STAGE_TRANSLATED) is not None
+        )
+        console.print(
+            Panel(
+                f"[bold red]Rate limit reached![/]\n\n"
+                f"  [bold]Translated:[/]          {translated_count}/{num_pages} pages\n"
+                f"  [bold]Verified:[/]            {done}/{num_pages} pages\n"
+                f"  [bold]API calls made:[/]      {api_calls_made}\n\n"
+                f"  Progress saved. Run again after the limit resets.",
+                title="[bold red]Stopped — Rate Limit[/]",
+                border_style="red",
+                padding=(1, 2),
+            )
+        )
+        return False
+
+    return True
+
+
+def assemble_translation_output(
+    pdf_path: Path,
+    first_page: int,
+    last_page: int,
+) -> None:
+    """Generate final translation outputs: .txt and .pdf files."""
+    all_page_nums = list(range(first_page, last_page + 1))
+    num_pages = len(all_page_nums)
+
+    page_texts = []
+    pages_with_text = []
+    missing = []
+
+    for p in all_page_nums:
+        # Prefer verified translation, fall back to raw translation
+        text = load_page_text(pdf_path, p, STAGE_TRANSLATION_VERIFIED)
+        if text is None:
+            text = load_page_text(pdf_path, p, STAGE_TRANSLATED)
+        if text is not None and not is_page_error(text):
+            page_texts.append(text)
+            pages_with_text.append(p)
+        else:
+            missing.append(p)
+
+    if not pages_with_text:
+        console.print("  [red]No translated pages yet.[/]")
+        return
+
+    if missing:
+        console.print(
+            f"  [yellow]{len(missing)} page(s) not yet translated.[/]"
+        )
+
+    stem = pdf_path.stem
+    DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_txt = DEFAULT_OUTPUT_DIR / f"{stem}_translation.txt"
+    output_pdf = DEFAULT_OUTPUT_DIR / f"{stem}_translation.pdf"
+
+    # Text file
+    with open(output_txt, "w", encoding="utf-8") as f:
+        for p, text in zip(pages_with_text, page_texts):
+            f.write(f"--- Page {p} ---\n")
+            f.write(text.strip())
+            f.write("\n\n")
+    console.print(f"  [green]Translation text:[/]  {output_txt}")
+
+    # Text PDF
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]{task.description}"),
+        transient=True,
+    ) as prog:
+        prog.add_task("Building translation PDF...", total=None)
+        create_text_pdf(output_pdf, pages_with_text, page_texts)
+    console.print(f"  [green]Translation PDF:[/]   {output_pdf}")
+
+    # Summary
+    n_translated = len(pages_with_text)
+    all_done = n_translated == num_pages and not missing
+
+    log.info(
+        "Translation output: translated=%d/%d, missing=%d",
+        n_translated, num_pages, len(missing),
+    )
+
+    summary = []
+    if all_done:
+        summary.append("[bold green]Translation Complete![/]\n")
+    else:
+        summary.append("[bold yellow]Translation Partially Complete[/]\n")
+
+    summary.append(f"  [bold]PDF:[/]         {output_pdf}")
+    summary.append(f"  [bold]Text file:[/]   {output_txt}")
+    summary.append(f"  [bold]Translated:[/]  {n_translated}/{num_pages} pages")
+
+    if missing:
+        summary.append(f"  [bold]Missing:[/]     {len(missing)} (run translation again)")
+
+    summary.append(
+        f"  [bold]Size:[/]        {format_file_size(output_pdf.stat().st_size)}"
+    )
+
+    console.print()
+    console.print(
+        Panel(
+            "\n".join(summary),
+            title="[bold green]Translation[/]" if all_done else "[bold yellow]Translation[/]",
+            border_style="green" if all_done else "yellow",
+            padding=(1, 2),
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -800,7 +1431,10 @@ def main():
 
     for p in all_page_nums:
         stage = get_page_stage(pdf_path, p)
-        if stage == STAGE_RECHECKED:
+        if stage in (STAGE_TRANSLATED, STAGE_TRANSLATION_VERIFIED):
+            # Already translated — OCR is fully done
+            pass
+        elif stage == STAGE_RECHECKED:
             # Fully done (3 passes completed)
             text = load_page_text(pdf_path, p, STAGE_RECHECKED)
             if text and is_page_error(text):
@@ -912,7 +1546,26 @@ def main():
                         break
                     api_calls_made += 1
 
+                    raw_len = len(raw_text)
                     raw_text = normalize_whitespace(raw_text)
+
+                    # Quality gate: detect garbage/hallucinated OCR output
+                    garbage, reason = is_garbage_output(raw_text, raw_len=raw_len)
+                    if garbage:
+                        log.warning("Page %d: garbage OCR detected — %s", page_num, reason)
+                        console.print(
+                            f"\n  [yellow]Page {page_num}: garbage OCR detected ({reason}) — skipping verify[/]"
+                        )
+                        save_page_text(
+                            pdf_path, page_num,
+                            f"[GARBAGE OUTPUT on page {page_num}: {reason}]",
+                            STAGE_OCR,
+                        )
+                        save_progress_json(pdf_path, first_page, last_page)
+                        prog.advance(task, 2)  # skip OCR + verify progress steps
+                        del img
+                        continue
+
                     save_page_text(pdf_path, page_num, raw_text, STAGE_OCR)
                     save_progress_json(pdf_path, first_page, last_page)
                     prog.advance(task)
@@ -962,6 +1615,22 @@ def main():
                     api_calls_made += 1
 
                     rechecked_text = normalize_whitespace(rechecked_text)
+
+                    # Quality gate: if recheck produced garbage, keep verified text
+                    garbage, reason = is_garbage_output(rechecked_text)
+                    if garbage:
+                        log.warning("Page %d: garbage recheck output (resumed) — %s; keeping verified text", page_num, reason)
+                        console.print(
+                            f"\n  [yellow]Page {page_num}: garbage recheck output ({reason}) — keeping verified text[/]"
+                        )
+                        save_page_text(
+                            pdf_path, page_num, verified_text, STAGE_RECHECKED
+                        )
+                        save_progress_json(pdf_path, first_page, last_page)
+                        prog.advance(task)
+                        del img
+                        continue
+
                     save_page_text(
                         pdf_path, page_num, rechecked_text, STAGE_RECHECKED
                     )
@@ -1018,6 +1687,20 @@ def main():
                 api_calls_made += 1
 
                 verified_text = normalize_whitespace(verified_text)
+
+                # Quality gate: if verify produced garbage, keep OCR text instead
+                garbage, reason = is_garbage_output(verified_text)
+                if garbage:
+                    log.warning("Page %d: garbage verify output — %s; keeping OCR text", page_num, reason)
+                    console.print(
+                        f"\n  [yellow]Page {page_num}: garbage verify output ({reason}) — keeping OCR text, skipping recheck[/]"
+                    )
+                    save_page_text(pdf_path, page_num, raw_text, STAGE_VERIFIED)
+                    save_progress_json(pdf_path, first_page, last_page)
+                    prog.advance(task)
+                    del img
+                    continue
+
                 save_page_text(pdf_path, page_num, verified_text, STAGE_VERIFIED)
                 save_progress_json(pdf_path, first_page, last_page)
                 prog.advance(task)
@@ -1047,6 +1730,21 @@ def main():
                     api_calls_made += 1
 
                     rechecked_text = normalize_whitespace(rechecked_text)
+
+                    # Quality gate: if recheck produced garbage, keep verified text
+                    garbage, reason = is_garbage_output(rechecked_text)
+                    if garbage:
+                        log.warning("Page %d: garbage recheck output — %s; keeping verified text", page_num, reason)
+                        console.print(
+                            f"\n  [yellow]Page {page_num}: garbage recheck output ({reason}) — keeping verified text[/]"
+                        )
+                        save_page_text(
+                            pdf_path, page_num, verified_text, STAGE_RECHECKED
+                        )
+                        save_progress_json(pdf_path, first_page, last_page)
+                        del img
+                        continue
+
                     save_page_text(
                         pdf_path, page_num, rechecked_text, STAGE_RECHECKED
                     )
@@ -1067,10 +1765,10 @@ def main():
                 save_progress_json(pdf_path, first_page, last_page)
                 prog.stop()
 
-                # Count current state (verified or rechecked = done)
+                # Count current state (verified/rechecked/translated = done)
                 done = sum(
                     1 for p in all_page_nums
-                    if get_page_stage(pdf_path, p) in (STAGE_VERIFIED, STAGE_RECHECKED)
+                    if get_page_stage(pdf_path, p) in (STAGE_VERIFIED, STAGE_RECHECKED, STAGE_TRANSLATED, STAGE_TRANSLATION_VERIFIED)
                     and not is_page_error(load_best_text(pdf_path, p) or "")
                 )
 
@@ -1145,7 +1843,7 @@ def main():
     # --- Summary ---
     n_done = sum(
         1 for p in all_page_nums
-        if get_page_stage(pdf_path, p) in (STAGE_VERIFIED, STAGE_RECHECKED)
+        if get_page_stage(pdf_path, p) in (STAGE_VERIFIED, STAGE_RECHECKED, STAGE_TRANSLATED, STAGE_TRANSLATION_VERIFIED)
         and not is_page_error(load_best_text(pdf_path, p) or "")
     )
     n_rechecked = sum(
@@ -1192,6 +1890,89 @@ def main():
         )
     )
 
+    # --- Translation prompt ---
+    if all_done and Confirm.ask(
+        "\n  [bold]Translate to English?[/]", default=False
+    ):
+        completed = process_translation(client, pdf_path, first_page, last_page)
+        if completed:
+            assemble_translation_output(pdf_path, first_page, last_page)
+
+
+def translate_only() -> None:
+    """Translation-only mode for already-OCR'd books."""
+    setup_logging()
+
+    console.print(
+        Panel(
+            "[bold]Sanskrit OCR Tool[/]\n"
+            "[dim]Translation-only mode[/]",
+            border_style="cyan",
+            padding=(1, 2),
+        )
+    )
+
+    pdf_path = select_pdf()  # exits on failure
+
+    total_pages = get_pdf_page_count(pdf_path)
+    console.print(f"\n  [bold]File:[/]  {pdf_path.name}")
+    console.print(f"  [bold]Pages:[/] {total_pages}")
+
+    # Detect page range from existing progress
+    progress_dir = get_progress_dir(pdf_path)
+    if not progress_dir.exists():
+        console.print("\n  [red]No OCR progress found for this PDF. Run OCR first.[/]")
+        return
+
+    # Find page range from existing OCR files
+    ocr_pages = []
+    for f in sorted(progress_dir.glob("page_*_ocr.txt")):
+        try:
+            num = int(f.stem.split("_")[1])
+            ocr_pages.append(num)
+        except (IndexError, ValueError):
+            continue
+
+    if not ocr_pages:
+        console.print("\n  [red]No OCR'd pages found. Run OCR first.[/]")
+        return
+
+    first_page = min(ocr_pages)
+    last_page = max(ocr_pages)
+
+    # Check how many pages are fully verified (have verified or rechecked text)
+    verified_count = 0
+    for p in range(first_page, last_page + 1):
+        stage = get_page_stage(pdf_path, p)
+        if stage in (STAGE_VERIFIED, STAGE_RECHECKED, STAGE_TRANSLATED, STAGE_TRANSLATION_VERIFIED):
+            verified_count += 1
+
+    console.print(f"  [bold]OCR range:[/] {first_page}-{last_page} ({last_page - first_page + 1} pages)")
+    console.print(f"  [bold]Verified:[/]  {verified_count}")
+
+    if not Confirm.ask("\n  [bold]Start translation?[/]", default=True):
+        console.print("\n  [dim]Cancelled.[/]")
+        return
+
+    api_key = load_api_key()
+    client = genai.Client(api_key=api_key)
+
+    completed = process_translation(client, pdf_path, first_page, last_page)
+    if completed:
+        assemble_translation_output(pdf_path, first_page, last_page)
+
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Sanskrit OCR Tool — LLM-powered OCR for scanned Sanskrit/Devanagari books."
+    )
+    parser.add_argument(
+        "--translate", action="store_true",
+        help="Translation-only mode for already-OCR'd books",
+    )
+    args = parser.parse_args()
+
+    if args.translate:
+        translate_only()
+    else:
+        main()

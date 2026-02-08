@@ -16,11 +16,14 @@ pip install -r requirements.txt
 # API key in .env (see .env.example)
 # Requires poppler for pdf2image: brew install poppler
 
-# Run
+# Run OCR
 python ocr_tool.py
+
+# Translation-only mode (for already-OCR'd books)
+python ocr_tool.py --translate
 ```
 
-Interactive CLI — prompts for PDF selection, page range, and resume options. No CLI flags.
+Interactive CLI — prompts for PDF selection, page range, and resume options. Uses `argparse` for CLI flags.
 
 ## Architecture
 
@@ -32,13 +35,17 @@ All logic is in `ocr_tool.py` (~1100 lines). The pipeline processes one page at 
 
 **Pass 3 (Recheck):** Auto-triggered when verify changes >20% of the OCR text (`compute_change_ratio()` using `difflib.SequenceMatcher`). Runs the verify prompt again on the already-verified text.
 
+**Pass 4 (Translate):** `gemini-2.5-pro` with thinking translates Sanskrit to English. Uses a sliding window of the previous 3 pages as context for terminology continuity. Prefers already-translated English context, falls back to Sanskrit source.
+
+**Pass 5 (Verify Translation):** `gemini-2.5-pro` compares the English translation against the Sanskrit source and corrects errors.
+
 **Progress tracking** is file-based and crash-proof:
-- `Output/{stem}_progress/page_NNNN_ocr.txt` → `_verified.txt` → `_rechecked.txt`
+- `Output/{stem}_progress/page_NNNN_ocr.txt` → `_verified.txt` → `_rechecked.txt` → `_translated.txt` → `_translation_verified.txt`
 - Stage is determined purely from which files exist (`get_page_stage()`)
 - `progress.json` is a convenience summary; the source of truth is the per-page files
 - On resume, the work list builder detects interrupted rechecks by comparing OCR vs verified text
 
-**Output:** Combined `.txt` file + searchable PDF (scanned images with invisible text overlay via reportlab).
+**Output:** Combined `.txt` file + searchable PDF (scanned images with invisible text overlay via reportlab). Translation produces a separate `_translation.txt` and `_translation.pdf` (readable English text, US Letter, Helvetica 11pt).
 
 ## Key Technical Details
 
@@ -46,7 +53,9 @@ All logic is in `ocr_tool.py` (~1100 lines). The pipeline processes one page at 
 - Rate limit detection: check for "429" or "RESOURCE_EXHAUSTED" in exception string
 - `normalize_whitespace()` collapses runs of 7+ spaces to 6 and 7+ dots to 4 — essential because Gemini OCR sometimes generates hundreds of spaces for columnar layouts
 - `ThinkingConfig` uses `thinking_budget` param (not `thinking_level`) for Gemini 2.5 models
-- Constants at top of file control all tunables: `DPI`, `MAX_OUTPUT_TOKENS`, model names, `RECHECK_THRESHOLD`, `THINKING_BUDGET_VERIFY`, `INTER_CALL_DELAY`
+- Constants at top of file control all tunables: `DPI`, `MAX_OUTPUT_TOKENS`, model names, `RECHECK_THRESHOLD`, `THINKING_BUDGET_VERIFY`, `THINKING_BUDGET_TRANSLATE`, `CONTEXT_WINDOW_PAGES`, `INTER_CALL_DELAY`
+- `_start_continuation_page()` is a shared helper used by `create_text_pdf()` for page overflow handling
+- `select_pdf()` always returns a `Path` or exits — callers don't need to check for `None`
 
 ## Common Devanagari OCR Errors
 
